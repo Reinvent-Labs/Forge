@@ -1,0 +1,17 @@
+{
+  "name": "@forge/agent-devops",
+  "version": "1.0.0",
+  "private": true,
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": { "build": "tsc", "typecheck": "tsc --noEmit" },
+  "dependencies": {
+    "@forge/database": "*",
+    "@forge/shared": "*",
+    "anthropic": "^0.27.0",
+    "zod": "^3.22.0",
+    "pino": "^8.19.0",
+    "node-fetch": "^3.3.0"
+  },
+  "devDependencies": { "@types/node": "^20.0.0", "typescript": "^5.4.0" }
+}

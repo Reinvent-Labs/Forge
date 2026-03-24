@@ -1,0 +1,105 @@
+---
+title: Metrics
+description: Query and ingest project metrics via the API.
+---
+
+## Get activity feed
+
+```http
+GET /api/projects/:id/activity?page=1&limit=20
+```
+
+Returns paginated agent task history.
+
+**Query parameters:**
+
+| Parameter | Default | Description |
+|---|---|---|
+| `page` | `1` | Page number |
+| `limit` | `20` | Items per page (max 100) |
+| `agent` | — | Filter by agent name |
+| `status` | — | Filter by status |
+
+**Response:**
+```json
+{
+  "items": [
+    {
+      "id": "task_1234...",
+      "agentName": "fixer",
+      "type": "BUG_FIX",
+      "status": "COMPLETED",
+      "summary": "Fixed null pointer in auth module",
+      "startedAt": "2024-01-15T10:00:00Z",
+      "completedAt": "2024-01-15T10:02:30Z",
+      "durationMs": 150000,
+      "tokensUsed": 4200,
+      "costUsd": 0.021
+    }
+  ],
+  "total": 47,
+  "page": 1,
+  "pages": 3
+}
+```
+
+---
+
+## Get integrations
+
+```http
+GET /api/projects/:id/integrations
+```
+
+Returns configured integrations and their connection status.
+
+**Response:**
+```json
+[
+  {
+    "type": "github",
+    "label": "GitHub",
+    "status": "connected",
+    "value": "org/acme-app",
+    "connectedAt": "2024-01-10T09:00:00Z"
+  },
+  {
+    "type": "slack",
+    "label": "Slack",
+    "status": "connected",
+    "value": "#forge-alerts",
+    "connectedAt": "2024-01-10T09:15:00Z"
+  },
+  {
+    "type": "datadog",
+    "label": "Datadog",
+    "status": "disconnected"
+  }
+]
+```
+
+---
+
+## Webhook events
+
+Forge sends webhook events to your configured URL for all agent actions:
+
+```json
+{
+  "event": "incident.created",
+  "timestamp": "2024-01-15T10:00:00Z",
+  "projectId": "clx1234...",
+  "data": {
+    "incidentId": "inc_5678...",
+    "title": "Error rate spike: 12%",
+    "severity": "HIGH"
+  }
+}
+```
+
+**Available events:**
+- `incident.created` / `incident.resolved`
+- `approval.created` / `approval.approved` / `approval.rejected`
+- `deployment.started` / `deployment.succeeded` / `deployment.failed`
+- `security.scan.completed`
+- `debt.report.generated`

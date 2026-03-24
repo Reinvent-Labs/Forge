@@ -1,0 +1,67 @@
+---
+title: Vercel Deployment
+description: Deploy the Forge dashboard to Vercel.
+---
+
+## Dashboard deployment
+
+The `apps/dashboard` Next.js app deploys to Vercel.
+
+### One-click deploy
+
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https://github.com/forge-dev/forge)
+
+### Manual deployment
+
+```bash
+cd apps/dashboard
+vercel deploy --prod
+```
+
+### Required environment variables
+
+Set these in your Vercel project settings:
+
+| Variable | Description |
+|---|---|
+| `DATABASE_URL` | PostgreSQL connection string |
+| `NEXTAUTH_URL` | Your dashboard URL (e.g. `https://dashboard.forge.dev`) |
+| `NEXTAUTH_SECRET` | Random secret (`openssl rand -base64 32`) |
+| `NEXT_PUBLIC_API_URL` | URL of your orchestrator API |
+
+## Landing page deployment
+
+The `apps/landing` Next.js app is a static site that deploys to Vercel:
+
+```bash
+cd apps/landing
+vercel deploy --prod
+```
+
+No environment variables needed — it's a fully static marketing site.
+
+## Continuous deployment
+
+The included GitHub Actions workflow handles automatic deployments:
+
+```yaml
+# .github/workflows/deploy-dashboard.yml
+on:
+  push:
+    branches: [main]
+    paths: [apps/dashboard/**]
+```
+
+Set these secrets in your GitHub repo:
+```
+VERCEL_TOKEN
+VERCEL_ORG_ID
+VERCEL_PROJECT_ID
+```
+
+## Custom domain
+
+In the Vercel dashboard:
+1. Go to your project → **Settings → Domains**
+2. Add your domain (e.g. `app.forge.dev`)
+3. Update `NEXTAUTH_URL` to match

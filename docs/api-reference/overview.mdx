@@ -1,0 +1,55 @@
+---
+title: API Overview
+description: The Forge REST API for integrating with the orchestrator programmatically.
+---
+
+## Base URL
+
+```
+https://your-forge-domain.com/api
+```
+
+In development: `http://localhost:4000/api`
+
+## Authentication
+
+All API requests require a bearer token:
+
+```bash
+Authorization: Bearer <your-api-key>
+```
+
+Get your API key from the dashboard: **Settings → API Keys**.
+
+## Response format
+
+All endpoints return JSON. Successful responses include the data directly. Errors return:
+
+```json
+{
+  "error": "Unauthorized",
+  "message": "Invalid or expired API key"
+}
+```
+
+## Common status codes
+
+| Code | Meaning |
+|---|---|
+| `200` | Success |
+| `201` | Created |
+| `400` | Bad request — check your parameters |
+| `401` | Unauthorized — invalid API key |
+| `403` | Forbidden — you don't have access to this resource |
+| `404` | Not found |
+| `500` | Internal error — check orchestrator logs |
+
+## Rate limiting
+
+API calls are limited to **1000 requests per hour** per API key. Headers on every response:
+
+```
+X-RateLimit-Limit: 1000
+X-RateLimit-Remaining: 987
+X-RateLimit-Reset: 1704067200
+```

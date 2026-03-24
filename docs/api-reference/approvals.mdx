@@ -1,0 +1,85 @@
+---
+title: Approvals
+description: Query and respond to agent approval requests via the API.
+---
+
+## List approvals
+
+```http
+GET /api/projects/:id/approvals?status=PENDING
+```
+
+**Query parameters:**
+
+| Parameter | Values | Default |
+|---|---|---|
+| `status` | `PENDING`, `APPROVED`, `REJECTED`, `EXPIRED` | `PENDING` |
+
+**Response:**
+```json
+[
+  {
+    "id": "apr_1234...",
+    "type": "PR_MERGE",
+    "title": "Merge PR #47 — Fix null pointer in auth",
+    "description": "Root cause: session refresh doesn't guard undefined user.id",
+    "riskLevel": "LOW",
+    "status": "PENDING",
+    "agentName": "fixer",
+    "metadata": {
+      "prNumber": 47,
+      "prUrl": "https://github.com/org/repo/pull/47"
+    },
+    "expiresAt": "2024-01-17T12:00:00Z",
+    "createdAt": "2024-01-15T12:00:00Z"
+  }
+]
+```
+
+---
+
+## Approve an action
+
+```http
+POST /api/projects/:id/approvals/:approvalId/approve
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "approval": {
+    "id": "apr_1234...",
+    "status": "APPROVED",
+    "approvedAt": "2024-01-15T14:30:00Z"
+  }
+}
+```
+
+---
+
+## Reject an action
+
+```http
+POST /api/projects/:id/approvals/:approvalId/reject
+```
+
+**Body (optional):**
+```json
+{
+  "reason": "Too risky to merge on a Friday"
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "approval": {
+    "id": "apr_1234...",
+    "status": "REJECTED",
+    "rejectedAt": "2024-01-15T14:30:00Z",
+    "rejectionReason": "Too risky to merge on a Friday"
+  }
+}
+```

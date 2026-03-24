@@ -1,0 +1,97 @@
+---
+title: Approvals
+description: How to review and act on agent approval requests.
+---
+
+## Overview
+
+When Forge is in `SEMI` autonomy mode (the default), high-impact actions require your explicit approval before they execute. This keeps you in control without requiring you to do the work yourself.
+
+## Approving an action
+
+You have three ways to approve or reject:
+
+<Tabs>
+  <Tab title="Dashboard">
+    Go to the **Approvals** page or click any approval card on the Overview.
+
+    Each card shows:
+    - **Action title** — what the agent wants to do
+    - **Reason** — why it's recommending this action
+    - **Risk level** — LOW / MEDIUM / HIGH
+    - **Preview** — code diff, config change, or SQL query
+    - **Approve** and **Reject** buttons
+
+    Approvals expire after 48 hours if not acted on.
+  </Tab>
+  <Tab title="Slack">
+    Forge sends an interactive message to your configured channel:
+
+    ```
+    🔧 Approval Required — Acme App
+
+    Action: Merge PR #47 — Fix null pointer in auth module
+    Risk: LOW
+
+    Root Cause:
+    The session refresh function doesn't check for undefined
+    before accessing user.id, causing crashes for 8% of users.
+
+    [✅ Approve]  [❌ Reject]
+    ```
+
+    Click the button directly in Slack. No need to open the dashboard.
+  </Tab>
+  <Tab title="Telegram">
+    Forge sends a message with inline keyboard buttons:
+
+    ```
+    🔧 Approval needed
+
+    Merge PR #47 – Fix null pointer in auth
+    Risk: LOW
+
+    [✅ Approve] [❌ Reject]
+    ```
+
+    Or use commands:
+    ```
+    /approve <approval-id>
+    /reject <approval-id> <optional reason>
+    ```
+  </Tab>
+</Tabs>
+
+## Approval types
+
+| Type | Example | Default risk |
+|---|---|---|
+| `PR_MERGE` | Merge a Fixer or Builder PR | LOW–MEDIUM |
+| `DEPLOY` | Deploy to production | MEDIUM |
+| `ROLLBACK` | Roll back a deployment | HIGH |
+| `DB_MIGRATION` | Run a schema migration | HIGH |
+| `SECRET_ROTATION` | Rotate an exposed secret | HIGH |
+| `DEPENDENCY_UPDATE` | Update a package | LOW |
+| `INFRA_CHANGE` | Modify cloud infrastructure | CRITICAL |
+
+## Rejection
+
+When you reject an action, you can provide a reason:
+
+```
+Reason: "Too risky to merge on a Friday, will review Monday"
+```
+
+The agent logs the rejection with your reason and marks the task as `BLOCKED`. It won't re-attempt the same action unless you explicitly unblock it.
+
+## Autonomy levels
+
+Change how many approvals you need:
+
+| Level | What requires approval |
+|---|---|
+| `MANUAL` | Everything |
+| `SEMI` | MEDIUM risk and above (default) |
+| `FULL` | CRITICAL only |
+
+Change it in **Settings → Project → Autonomy Level**.

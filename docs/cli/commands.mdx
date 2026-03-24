@@ -1,0 +1,145 @@
+---
+title: CLI Commands
+description: Full reference for all forge CLI commands.
+---
+
+## forge init
+
+Set up Forge in the current project directory.
+
+```bash
+forge init
+```
+
+Interactive prompts will ask for:
+- Project name
+- GitHub repository URL
+- Anthropic API key
+- Slack/Telegram credentials (optional)
+
+Creates a `forge.config.json` in your project root and registers the project with the Forge API.
+
+---
+
+## forge connect
+
+Connect an external service.
+
+```bash
+forge connect <service>
+```
+
+**Services:** `github`, `slack`, `telegram`, `vercel`, `datadog`, `sentry`
+
+**Example:**
+```bash
+forge connect github
+# → Opens browser to authorize GitHub OAuth
+# → Saves token to project config
+```
+
+---
+
+## forge status
+
+Show the current health of your project.
+
+```bash
+forge status
+forge status --project <project-id>
+forge status --json
+```
+
+**Output:**
+```
+Acme App — Health Score: 87/100
+
+  Uptime:       99.9%
+  Error rate:   0.3%
+  Open issues:  2
+  Open PRs:     1
+
+Recent Activity:
+  ✓ Security scan completed (2h ago)
+  ✓ PR #47 merged — null pointer fix (5h ago)
+  ⚠ Incident #12 — High latency spike (1d ago, resolved)
+```
+
+---
+
+## forge logs
+
+Stream live agent activity.
+
+```bash
+forge logs
+forge logs --agent watcher
+forge logs --agent fixer
+forge logs --since 1h
+forge logs --level error
+```
+
+**Flags:**
+| Flag | Description |
+|---|---|
+| `--agent` | Filter by agent name |
+| `--since` | Show logs from this time ago (e.g. `1h`, `30m`, `1d`) |
+| `--level` | Filter by log level: `info`, `warn`, `error` |
+| `--json` | Output as JSON |
+
+---
+
+## forge deploy
+
+Trigger a production deployment.
+
+```bash
+forge deploy
+forge deploy --env staging
+forge deploy --commit <sha>
+```
+
+Delegates to the DevOps agent, which tracks the deployment and watches for errors post-deploy.
+
+---
+
+## forge approve
+
+Interactively review and approve pending actions.
+
+```bash
+forge approve
+forge approve <approval-id>
+forge approve --all-low-risk
+```
+
+Running with no arguments shows an interactive list of pending approvals with full context.
+
+**Example:**
+```
+? Pending approvals (2)
+
+❯ [LOW]  Merge PR #47 — Fix null pointer in auth (Fixer, 2h ago)
+  [HIGH] Run DB migration — Add users.plan_tier column (Fixer, 1d ago)
+
+→ Select an approval to review
+```
+
+---
+
+## forge build
+
+Queue a feature request for the Builder agent.
+
+```bash
+forge build "Add a CSV export button to the users table"
+forge build "Add a CSV export button" --priority high
+forge build "Add a CSV export button" --no-tests
+```
+
+**Flags:**
+| Flag | Description |
+|---|---|
+| `--priority` | `low`, `medium`, `high` (default: `medium`) |
+| `--no-tests` | Skip test generation |
+| `--dry-run` | Show implementation plan without queuing |

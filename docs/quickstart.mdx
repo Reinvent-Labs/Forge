@@ -1,0 +1,124 @@
+---
+title: Quickstart
+description: Get Forge running locally in under 5 minutes.
+---
+
+## Prerequisites
+
+- [Docker](https://docs.docker.com/get-docker/) and Docker Compose
+- [Node.js](https://nodejs.org/) 20+
+- [npm](https://npmjs.com/) 10+
+- An [Anthropic API key](https://console.anthropic.com/)
+
+## 1. Clone the repository
+
+```bash
+git clone https://github.com/forge-dev/forge.git
+cd forge
+```
+
+## 2. Install dependencies
+
+```bash
+npm install
+```
+
+## 3. Configure environment variables
+
+Copy the example env files and fill in your API keys:
+
+```bash
+# Orchestrator (the agent runtime)
+cp packages/orchestrator/.env.example packages/orchestrator/.env
+
+# Dashboard
+cp apps/dashboard/.env.local.example apps/dashboard/.env.local
+```
+
+At minimum, set your Anthropic API key:
+
+```bash
+# packages/orchestrator/.env
+ANTHROPIC_API_KEY=sk-ant-...
+```
+
+<Tip>
+  All other values have working defaults for local development. You only need the Anthropic key to get started.
+</Tip>
+
+## 4. Start infrastructure
+
+Forge needs Postgres, Redis, and optionally Grafana + Prometheus. Everything is pre-configured:
+
+```bash
+docker compose up -d
+```
+
+This starts:
+| Service | Port | Description |
+|---|---|---|
+| PostgreSQL | 5435 | Main database |
+| Redis | 6380 | Agent job queue + sessions |
+| Grafana | 3007 | Metrics dashboard |
+| Prometheus | 9092 | Metrics scraper |
+| MinIO | 9000 | Object storage |
+| Vault | 8200 | Secrets management |
+
+## 5. Set up the database
+
+```bash
+# Run migrations
+cd packages/database
+npx prisma db push
+
+# Seed with demo data
+npm run db:seed
+```
+
+This creates:
+- A demo organization (`acme-startup`)
+- A demo user: `founder@acme.dev` / `password`
+- A sample project with 30 days of metrics, incidents, and debt items
+
+## 6. Start the development servers
+
+```bash
+# From the repo root — starts everything in parallel
+npm run dev
+```
+
+| App | URL | Description |
+|---|---|---|
+| Dashboard | http://localhost:3003 | Founder dashboard |
+| Landing page | http://localhost:3004 | Marketing site |
+| Orchestrator | http://localhost:4000 | Agent API |
+
+## 7. Log in
+
+Open http://localhost:3003 and sign in with:
+
+```
+Email:    founder@acme.dev
+Password: password
+```
+
+You'll see the demo project with live metrics, incident history, and pending approvals.
+
+---
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Connect GitHub" icon="github" href="/integrations/github">
+    Let agents open PRs and respond to CI events
+  </Card>
+  <Card title="Connect Slack" icon="slack" href="/integrations/slack">
+    Get approvals and alerts in your Slack workspace
+  </Card>
+  <Card title="Configure agents" icon="robot" href="/agents/overview">
+    Set autonomy levels and notification preferences
+  </Card>
+  <Card title="Deploy to production" icon="cloud" href="/deployment/docker">
+    Run Forge on your own infrastructure
+  </Card>
+</CardGroup>

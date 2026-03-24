@@ -1,0 +1,78 @@
+---
+title: GitHub Integration
+description: Connect GitHub so Forge can read your code, open PRs, and respond to CI events.
+---
+
+## What it enables
+
+Connecting GitHub unlocks the core of Forge's capabilities:
+
+- Fixer and Builder agents can **open PRs** with their changes
+- DevOps agent receives **webhook events** when CI passes or fails
+- Onboarding agent can **clone your repository** for analysis
+- Security agent can **comment on PRs** with scan results
+
+## Setup
+
+### 1. Create a GitHub token
+
+Go to [GitHub Settings → Tokens](https://github.com/settings/tokens/new) and create a **fine-grained personal access token** with:
+
+| Permission | Level |
+|---|---|
+| Contents | Read and write |
+| Pull requests | Read and write |
+| Commit statuses | Read and write |
+| Metadata | Read |
+| Webhooks | Read and write |
+
+### 2. Add to environment
+
+```bash
+# packages/orchestrator/.env
+GITHUB_TOKEN=ghp_your-token
+GITHUB_OWNER=your-org-or-username
+GITHUB_REPO=your-repo-name
+```
+
+### 3. Configure the webhook
+
+In your GitHub repo settings, add a webhook:
+
+```
+Payload URL:  https://your-forge-domain.com/webhooks/github
+Content type: application/json
+Secret:       (generate a random string and set GITHUB_WEBHOOK_SECRET)
+
+Events:
+  ✓ Push
+  ✓ Pull requests
+  ✓ Check runs
+  ✓ Deployments
+```
+
+```bash
+GITHUB_WEBHOOK_SECRET=your-random-secret
+```
+
+## PR conventions
+
+Forge follows these conventions when opening PRs:
+
+- Branch name: `forge/<agent>/<short-description>` (e.g., `forge/fixer/fix-null-pointer-auth`)
+- Title prefix: `[Forge]` for easy filtering
+- Always includes a description, root cause, and testing checklist
+- Assigns to the project's configured team members
+
+## Using with GitHub Actions
+
+Forge's CI/CD integration uses the included GitHub Actions workflows:
+
+```
+.github/workflows/
+├── ci.yml               # Typecheck + lint + test on every PR
+├── deploy-dashboard.yml # Deploy dashboard to Vercel on merge
+└── deploy-orchestrator.yml # Publish Docker image on merge
+```
+
+The DevOps agent reads these workflow runs via the GitHub API to detect failures.

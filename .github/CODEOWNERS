@@ -1,0 +1,69 @@
+# CODEOWNERS — GitHub auto-assigns reviewers based on these rules.
+#
+# Rules are evaluated from top to bottom; the LAST matching rule wins.
+# Ordering: catch-all first, then progressively more specific paths.
+#
+# Team references follow the format @<org>/<team-slug>.
+# Update these slugs to match your actual GitHub organization team names.
+#
+# Docs: https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# ---------------------------------------------------------------------------
+# Catch-all: every file not matched by a more specific rule below requires
+# review from the general forge-team. This prevents any file from being
+# merged without at least one designated reviewer.
+# ---------------------------------------------------------------------------
+*                               @forge-team
+
+# ---------------------------------------------------------------------------
+# Frontend — Dashboard app
+# Owned by the frontend team. Includes all Next.js pages, components,
+# styles, and dashboard-specific configuration.
+# ---------------------------------------------------------------------------
+apps/dashboard/**               @forge-frontend
+apps/landing/**                 @forge-frontend
+
+# ---------------------------------------------------------------------------
+# Agents — All agent packages
+# Each agent sub-package is co-owned by the agents team.
+# ---------------------------------------------------------------------------
+packages/agents/**              @forge-agents
+
+# ---------------------------------------------------------------------------
+# Orchestrator — Event bus, routing, approvals, confidence engine
+# Owned by the backend team who maintain the Fastify service and BullMQ queues.
+# ---------------------------------------------------------------------------
+packages/orchestrator/**        @forge-backend
+
+# ---------------------------------------------------------------------------
+# Adapters (Slack, Telegram, etc.)
+# Integration adapters sit between agents and external platforms.
+# The backend team owns these since they interface with the orchestrator.
+# ---------------------------------------------------------------------------
+packages/adapters/**            @forge-backend
+
+# ---------------------------------------------------------------------------
+# Shared library & auth
+# Cross-cutting concerns reviewed by the backend team.
+# ---------------------------------------------------------------------------
+packages/shared/**              @forge-backend
+packages/auth/**                @forge-backend
+
+# ---------------------------------------------------------------------------
+# Database schema & migrations
+# Migrations are high-risk; require backend review.
+# ---------------------------------------------------------------------------
+packages/database/**            @forge-backend
+
+# ---------------------------------------------------------------------------
+# Infrastructure — Terraform, Kubernetes, Helm, Docker configs outside packages
+# The DevOps team owns everything under infra/.
+# ---------------------------------------------------------------------------
+infra/**                        @forge-devops
+
+# ---------------------------------------------------------------------------
+# CI/CD workflows
+# Changes to pipelines require both the triggering team's review and DevOps
+# sign-off, since a bad workflow can break all deployments.
+# ---------------------------------------------------------------------------
+.github/**                      @forge-devops

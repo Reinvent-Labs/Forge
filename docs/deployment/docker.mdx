@@ -1,0 +1,110 @@
+---
+title: Docker Deployment
+description: Deploy the full Forge stack using Docker Compose.
+---
+
+## Overview
+
+The `docker-compose.yml` at the repo root defines the complete Forge infrastructure. It's the recommended way to run Forge in production on a self-hosted server.
+
+## Services
+
+| Service | Port | Description |
+|---|---|---|
+| `forge-postgres` | 5435 | PostgreSQL database |
+| `forge-redis` | 6380 | Redis (job queues + sessions) |
+| `forge-vault` | 8200 | HashiCorp Vault (secrets) |
+| `forge-prometheus` | 9092 | Metrics collection |
+| `forge-grafana` | 3007 | Metrics dashboard |
+| `forge-minio` | 9000 | Object storage |
+
+## Production setup
+
+### 1. Clone on your server
+
+```bash
+git clone https://github.com/forge-dev/forge.git
+cd forge
+```
+
+### 2. Configure environment
+
+```bash
+cp packages/orchestrator/.env.example packages/orchestrator/.env
+```
+
+Edit the file and set all production values:
+
+```bash
+NODE_ENV=production
+ANTHROPIC_API_KEY=sk-ant-...
+DATABASE_URL=postgresql://forge:STRONG_PASSWORD@localhost:5435/forge
+REDIS_URL=redis://:STRONG_PASSWORD@localhost:6380
+NEXTAUTH_SECRET=generate-with-openssl-rand-base64-32
+GITHUB_TOKEN=ghp_...
+SLACK_BOT_TOKEN=xoxb-...
+```
+
+### 3. Start infrastructure
+
+```bash
+docker compose up -d
+```
+
+### 4. Run migrations and seed
+
+```bash
+cd packages/database
+npm install
+npx prisma migrate deploy
+```
+
+### 5. Build and start the orchestrator
+
+```bash
+cd packages/orchestrator
+npm install
+npm run build
+npm start
+```
+
+### 6. Deploy the dashboard to Vercel
+
+```bash
+cd apps/dashboard
+vercel deploy --prod
+```
+
+## Updating
+
+```bash
+git pull
+docker compose pull
+docker compose up -d
+cd packages/database && npx prisma migrate deploy
+```
+
+## Data persistence
+
+All data is persisted in Docker named volumes:
+
+```yaml
+volumes:
+  forge_postgres_data:
+  forge_redis_data:
+  forge_vault_data:
+  forge_minio_data:
+```
+
+Backup the Postgres volume regularly:
+
+```bash
+docker exec forge-postgres pg_dump -U forge forge > backup.sql
+```
+
+## Health check
+
+```bash
+curl http://localhost:4000/health
+# → { "status": "ok", "agents": 7, "uptime": 3600 }
+```

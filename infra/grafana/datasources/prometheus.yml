@@ -1,0 +1,11 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # Uses the internal Docker network name — works because Grafana and
+    # Prometheus are on the same forge-network.
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true

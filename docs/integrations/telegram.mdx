@@ -1,0 +1,81 @@
+---
+title: Telegram Integration
+description: Get alerts and control Forge from Telegram.
+---
+
+## Setup
+
+### 1. Create a bot
+
+Message [@BotFather](https://t.me/BotFather) on Telegram:
+
+```
+/newbot
+Name: Forge CTO
+Username: forge_cto_bot
+```
+
+BotFather will give you a token. Copy it.
+
+### 2. Add to environment
+
+```bash
+TELEGRAM_BOT_TOKEN=123456:ABC-your-token
+TELEGRAM_CHAT_ID=your-chat-id   # Your personal chat ID or group ID
+```
+
+To get your chat ID: message your bot, then open:
+```
+https://api.telegram.org/bot<TOKEN>/getUpdates
+```
+Look for `"chat": {"id": ...}` in the response.
+
+### 3. Set webhook (production)
+
+```bash
+BOT_WEBHOOK_DOMAIN=https://your-forge-domain.com
+```
+
+In development, the bot uses long polling automatically.
+
+## Commands
+
+| Command | Description |
+|---|---|
+| `/start` | Introduction and link to dashboard |
+| `/status` | Current health score and open incidents |
+| `/approve <id>` | Approve a pending action |
+| `/reject <id>` | Reject a pending action |
+| `/incidents` | List open incidents |
+| `/help` | Show all commands |
+
+## Approval messages
+
+```
+🔧 Approval needed — Acme App
+
+Merge PR #47 – Fix null pointer in auth module
+Risk: LOW
+
+Root cause: Session refresh doesn't guard against
+undefined user.id — causing 8% of logins to fail.
+
+[✅ Approve] [❌ Reject]
+```
+
+Tap a button directly in the chat — no typing required.
+
+## Alerts
+
+Critical alerts are sent immediately:
+
+```
+🚨 CRITICAL — Acme App
+
+Error rate: 18% (threshold: 5%)
+~120 users affected
+
+Forge is analyzing...
+```
+
+Weekly digests are sent every Monday morning.

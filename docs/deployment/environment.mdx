@@ -1,0 +1,93 @@
+---
+title: Environment Variables
+description: Complete reference for all Forge environment variables.
+---
+
+## Orchestrator
+
+`packages/orchestrator/.env`
+
+### Required
+
+| Variable | Description |
+|---|---|
+| `ANTHROPIC_API_KEY` | Your Anthropic API key (`sk-ant-...`) |
+| `DATABASE_URL` | PostgreSQL connection string |
+| `REDIS_URL` | Redis connection string |
+
+### Authentication
+
+| Variable | Default | Description |
+|---|---|---|
+| `NEXTAUTH_SECRET` | — | Random secret for JWT signing |
+| `NEXTAUTH_URL` | `http://localhost:3003` | Dashboard URL |
+
+### GitHub
+
+| Variable | Description |
+|---|---|
+| `GITHUB_TOKEN` | Personal access token or GitHub App key |
+| `GITHUB_OWNER` | Repository owner (org or username) |
+| `GITHUB_REPO` | Repository name |
+| `GITHUB_WEBHOOK_SECRET` | Webhook validation secret |
+
+### Slack
+
+| Variable | Description |
+|---|---|
+| `SLACK_BOT_TOKEN` | Bot OAuth token (`xoxb-...`) |
+| `SLACK_WEBHOOK_URL` | Incoming webhook URL |
+| `SLACK_CHANNEL` | Default alert channel (e.g. `#forge-alerts`) |
+
+### Telegram
+
+| Variable | Description |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | Bot token from BotFather |
+| `TELEGRAM_CHAT_ID` | Chat ID to send alerts to |
+| `BOT_WEBHOOK_DOMAIN` | Your domain for webhook mode (production) |
+
+### Vercel
+
+| Variable | Description |
+|---|---|
+| `VERCEL_TOKEN` | API token |
+| `VERCEL_ORG_ID` | Organization ID |
+| `VERCEL_PROJECT_ID` | Project ID |
+
+### Agent tuning
+
+| Variable | Default | Description |
+|---|---|---|
+| `WATCHER_POLL_INTERVAL_MS` | `300000` | How often Watcher checks metrics |
+| `WATCHER_ERROR_RATE_THRESHOLD` | `0.05` | Error rate to trigger alert |
+| `WATCHER_P95_LATENCY_THRESHOLD` | `500` | p95 latency (ms) to trigger alert |
+| `DEVOPS_ROLLBACK_THRESHOLD` | `0.10` | Error rate delta to trigger rollback |
+| `DEVOPS_WATCH_WINDOW_MS` | `600000` | Post-deploy monitoring window |
+| `SECURITY_SCAN_SCHEDULE` | `0 2 * * *` | Security scan cron |
+| `DEBT_SCAN_SCHEDULE` | `0 9 * * MON` | Debt scan cron |
+
+---
+
+## Dashboard
+
+`apps/dashboard/.env.local`
+
+| Variable | Description |
+|---|---|
+| `DATABASE_URL` | PostgreSQL connection string |
+| `NEXTAUTH_URL` | Dashboard URL |
+| `NEXTAUTH_SECRET` | JWT signing secret (same as orchestrator) |
+| `NEXT_PUBLIC_API_URL` | Orchestrator API URL |
+
+---
+
+## Generating secrets
+
+```bash
+# NEXTAUTH_SECRET
+openssl rand -base64 32
+
+# GITHUB_WEBHOOK_SECRET
+openssl rand -hex 20
+```

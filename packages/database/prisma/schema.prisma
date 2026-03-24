@@ -1,0 +1,711 @@
+// =============================================================================
+// FORGE — Prisma Schema
+// PostgreSQL + pgvector
+// =============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions", "multiSchema"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [uuidOssp(map: "uuid-ossp"), pgcrypto, vector]
+}
+
+// =============================================================================
+// MULTI-TENANCY: Organizations & Users
+// =============================================================================
+
+model Organization {
+  id          String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  name        String
+  slug        String   @unique
+  planTier    PlanTier @default(STARTER)
+  encKey      String   // Per-tenant AES-256 encryption key (itself encrypted with master key)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  members     OrgMember[]
+  projects    Project[]
+  invitations OrgInvitation[]
+  apiKeys     ApiKey[]
+
+  @@map("organizations")
+}
+
+model User {
+  id             String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  email          String   @unique
+  name           String
+  passwordHash   String?  // bcrypt hash — null for OAuth-only accounts
+  avatarUrl      String?
+  emailVerified  Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  memberships    OrgMember[]
+  sessions       Session[]
+  approvals      ApprovalRequest[] @relation("ApprovedBy")
+
+  @@map("users")
+}
+
+model Session {
+  id        String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  userId    String   @db.Uuid
+  token     String   @unique
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  ipAddress String?
+  userAgent String?
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model OrgMember {
+  id             String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  organizationId String    @db.Uuid
+  userId         String    @db.Uuid
+  role           OrgRole   @default(VIEWER)
+  joinedAt       DateTime  @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, userId])
+  @@map("org_members")
+}
+
+model OrgInvitation {
+  id             String    @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  organizationId String    @db.Uuid
+  email          String
+  role           OrgRole   @default(DEVELOPER)
+  token          String    @unique @default(dbgenerated("encode(gen_random_bytes(32), 'hex')"))
+  expiresAt      DateTime
+  acceptedAt     DateTime?
+  createdAt      DateTime  @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@map("org_invitations")
+}
+
+model ApiKey {
+  id             String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  organizationId String   @db.Uuid
+  name           String
+  keyHash        String   @unique // SHA-256 of the key
+  prefix         String   // First 8 chars shown in UI
+  lastUsedAt     DateTime?
+  expiresAt      DateTime?
+  createdAt      DateTime @default(now())
+  revokedAt      DateTime?
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@map("api_keys")
+}
+
+// =============================================================================
+// PROJECTS
+// =============================================================================
+
+model Project {
+  id             String          @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  organizationId String          @db.Uuid
+  name           String
+  description    String?
+  slug           String
+  status         ProjectStatus   @default(ACTIVE)
+  startupStage   StartupStage    @default(MVP)
+  autonomyLevel  AutonomyLevel   @default(SUGGEST)
+
+  // GitHub App installation
+  githubInstallationId String?
+  githubRepoOwner      String?
+  githubRepoName       String?
+  defaultBranch        String?  @default("main")
+
+  // Hosting
+  hostingProvider      String?  // vercel | railway | render | fly | custom
+  hostingProjectId     String?
+  productionUrl        String?
+  stagingUrl           String?
+
+  // Notification config (encrypted JSON)
+  notificationConfig   Json?
+
+  // Coding standards (injected into agent context)
+  codingStandards      String?
+
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  organization         Organization        @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  credentials          ProjectCredential[]
+  contexts             CodebaseContext[]
+  agentTasks           AgentTask[]
+  approvalRequests     ApprovalRequest[]
+  incidents            Incident[]
+  deployments          Deployment[]
+  debtItems            DebtItem[]
+  fixPatterns          FixPattern[]
+  securityScans        SecurityScan[]
+  metrics              ProjectMetricsSnapshot[]
+  auditLogs            AuditLog[]
+  integrations         ProjectIntegration[]
+
+  @@unique([organizationId, slug])
+  @@map("projects")
+}
+
+model ProjectCredential {
+  id             String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  projectId      String   @db.Uuid
+  name           String   // e.g. STRIPE_SECRET_KEY
+  encryptedValue String   // AES-256 encrypted with per-tenant key
+  service        String   // e.g. stripe | github | vercel
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  rotatedAt      DateTime?
+
+  project        Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, name])
+  @@map("project_credentials")
+}
+
+model ProjectIntegration {
+  id             String              @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  projectId      String              @db.Uuid
+  type           IntegrationType
+  config         Json                // encrypted, integration-specific config
+  status         IntegrationStatus   @default(CONNECTED)
+  lastSyncAt     DateTime?
+  errorMessage   String?
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  project        Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, type])
+  @@map("project_integrations")
+}
+
+// =============================================================================
+// CODEBASE CONTEXT (Knowledge Graph)
+// =============================================================================
+
+model CodebaseContext {
+  id             String       @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  projectId      String       @db.Uuid
+  lastUpdated    DateTime     @default(now())
+  techStack      Json         // TechStackSnapshot
+  teamMembers    Json         // TeamMember[]
+
+  project        Project      @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  modules        ModuleNode[]
+  adrs           Adr[]
+
+  @@map("codebase_contexts")
+}
+
+model ModuleNode {
+  id                     String           @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  contextId              String           @db.Uuid
+  path                   String
+  plainEnglishDescription String
+  lastModified           DateTime
+  lastModifiedBy         String
+  incidentCount          Int              @default(0)
+  testCoverage           Float            @default(0)
+  complexityScore        Float            @default(0)
+  embeddingId            String?          // reference to pgvector row
+
+  context                CodebaseContext  @relation(fields: [contextId], references: [id], onDelete: Cascade)
+  embeddings             ModuleEmbedding[]
+
+  @@unique([contextId, path])
+  @@map("module_nodes")
+}
+
+model ModuleEmbedding {
+  id         String      @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  moduleId   String      @db.Uuid
+  content    String      // The text that was embedded
+  embedding  Unsupported("vector(1536)")  // pgvector
+  createdAt  DateTime    @default(now())
+
+  module     ModuleNode  @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+
+  @@map("module_embeddings")
+}
+
+model Adr {
+  id          String          @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  contextId   String          @db.Uuid
+  title       String
+  status      AdrStatus       @default(PROPOSED)
+  context     String
+  decision    String
+  consequences String
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  codebaseContext CodebaseContext @relation(fields: [contextId], references: [id], onDelete: Cascade)
+
+  @@map("adrs")
+}
+
+// =============================================================================
+// AGENT TASKS
+// =============================================================================
+
+model AgentTask {
+  id              String         @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  projectId       String         @db.Uuid
+  type            TaskType
+  priority        TaskPriority   @default(NORMAL)
+  status          TaskStatus     @default(QUEUED)
+  agentType       AgentType
+  requestedBy     RequestedBy    @default(SYSTEM)
+  requestedByUser String?        @db.Uuid
+  autonomyLevel   AutonomyLevel  @default(SUGGEST)
+
+  payload         Json           // task-specific input
+  result          Json?          // task-specific output
+  errorMessage    String?
+
+  startedAt       DateTime?
+  completedAt     DateTime?
+  durationMs      Int?
+
+  confidenceScore Json?          // ConfidenceScore snapshot
+  prUrl           String?        // PR created for this task
+  prNumber        Int?
+
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  project         Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  approvalRequest ApprovalRequest?
+
+  @@map("agent_tasks")
+}
+
+// =============================================================================
+// APPROVAL GATEWAY
+// =============================================================================
+
+model ApprovalRequest {
+  id                   String           @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  projectId            String           @db.Uuid
+  taskId               String           @unique @db.Uuid
+  agentType            AgentType
+  title                String
+  businessImpact       String
+  technicalDetails     String
+  confidenceScore      Json
+  riskLevel            RiskLevel
+  status               ApprovalStatus   @default(PENDING)
+  approveToken         String           @unique
+  rejectToken          String           @unique
+  expiresAt            DateTime
+  notificationsSent    Json             @default("[]")
+
+  approvedById         String?          @db.Uuid
+  approvedAt           DateTime?
+  rejectionReason      String?
+
+  createdAt            DateTime         @default(now())
+  updatedAt            DateTime         @updatedAt
+
+  project              Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  task                 AgentTask        @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  approvedBy           User?            @relation("ApprovedBy", fields: [approvedById], references: [id])
+
+  @@map("approval_requests")
+}
+
+// =============================================================================
+// INCIDENTS & FIX PATTERNS
+// =============================================================================
+
+model Incident {
+  id                 String          @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  projectId          String          @db.Uuid
+  title              String
+  description        String
+  severity           IncidentSeverity
+  status             IncidentStatus  @default(OPEN)
+  affectedModules    String[]
+  affectedUsers      Int?
+  errorFingerprint   String?
+
+  detectedAt         DateTime        @default(now())
+  acknowledgedAt     DateTime?
+  resolvedAt         DateTime?
+  postmortemUrl      String?
+  remediationNotes   String?
+
+  taskId             String?         @db.Uuid
+  deploymentId       String?         @db.Uuid
+
+  project            Project         @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@map("incidents")
+}
+
+model FixPattern {
+  id                 String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  projectId          String   @db.Uuid
+  errorFingerprint   String
+  errorDescription   String
+  fixApplied         String
+  filesChanged       String[]
+  successCount       Int      @default(0)
+  failureCount       Int      @default(0)
+  lastApplied        DateTime?
+  avgTimeToFixSec    Int?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  project            Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, errorFingerprint])
+  @@map("fix_patterns")
+}
+
+// =============================================================================
+// DEPLOYMENTS
+// =============================================================================
+
+model Deployment {
+  id             String            @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  projectId      String            @db.Uuid
+  environment    DeployEnvironment
+  status         DeployStatus      @default(PENDING)
+  provider       String
+  externalId     String?           // Provider's deployment ID
+  commitSha      String?
+  commitMessage  String?
+  branch         String?
+  triggeredBy    String?
+  url            String?
+  autoRolledBack Boolean           @default(false)
+  rollbackReason String?
+
+  startedAt      DateTime          @default(now())
+  completedAt    DateTime?
+  durationMs     Int?
+
+  project        Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@map("deployments")
+}
+
+// =============================================================================
+// TECHNICAL DEBT
+// =============================================================================
+
+model DebtItem {
+  id                       String      @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  projectId                String      @db.Uuid
+  type                     DebtType
+  severity                 DebtSeverity
+  filePath                 String
+  lineNumber               Int?
+  plainEnglishDescription  String
+  technicalDescription     String
+  estimatedHours           Float
+  businessRisk             String
+  suggestedSprint          Int?
+  detectedAt               DateTime    @default(now())
+  resolvedAt               DateTime?
+  resolvedByPr             String?
+
+  project                  Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@map("debt_items")
+}
+
+// =============================================================================
+// SECURITY
+// =============================================================================
+
+model SecurityScan {
+  id             String         @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  projectId      String         @db.Uuid
+  scanType       SecurityScanType
+  status         ScanStatus     @default(RUNNING)
+  score          Int?
+  data           Json?          // scan-specific results: { critical, high, medium, low, secretsFound, etc. }
+  findingsCount  Json?          // { critical, high, medium, low }
+  findings       Json?          // Full findings array
+  startedAt      DateTime       @default(now())
+  completedAt    DateTime?
+  errorMessage   String?
+
+  project        Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@map("security_scans")
+}
+
+// =============================================================================
+// METRICS SNAPSHOTS
+// =============================================================================
+
+model ProjectMetricsSnapshot {
+  id             String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  projectId      String   @db.Uuid
+  capturedAt     DateTime @default(now())
+
+  // Business
+  activeUsers    Int?
+  newSignups     Int?
+  revenue        Float?
+
+  // Technical
+  errorRate      Float?
+  p50Latency     Float?
+  p95Latency     Float?
+  p99Latency     Float?
+  uptimePercent  Float?
+
+  // Code health
+  testCoverage   Float?
+  securityScore  Int?
+  debtScore      Int?
+  openPrs        Int?
+
+  project        Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@map("project_metrics_snapshots")
+}
+
+// =============================================================================
+// AUDIT LOG (immutable)
+// =============================================================================
+
+model AuditLog {
+  id             String   @id @default(dbgenerated("uuid_generate_v4()")) @db.Uuid
+  projectId      String   @db.Uuid
+  organizationId String   @db.Uuid
+  actor          String   // agent type + task ID, or user ID
+  actorType      String   // 'agent' | 'user' | 'system'
+  action         String
+  resourceType   String
+  resourceId     String?
+  outcome        String   // 'success' | 'failure'
+  durationMs     Int?
+  metadata       Json?
+  createdAt      DateTime @default(now()) @db.Timestamptz
+
+  project        Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  // Partitioned by month for performance at scale
+  @@map("audit_logs")
+}
+
+// =============================================================================
+// ENUMS
+// =============================================================================
+
+enum PlanTier {
+  STARTER
+  GROWTH
+  SCALE
+  ENTERPRISE
+}
+
+enum OrgRole {
+  OWNER
+  ADMIN
+  DEVELOPER
+  VIEWER
+}
+
+enum ProjectStatus {
+  ACTIVE
+  PAUSED
+  ARCHIVED
+}
+
+enum StartupStage {
+  IDEA
+  MVP
+  GROWTH
+  SCALE
+}
+
+enum AutonomyLevel {
+  SUGGEST      // Always ask before acting
+  SEMI         // Act autonomously for low-risk, ask for medium+
+  AUTONOMOUS   // Act autonomously unless critical/high risk
+}
+
+enum TaskType {
+  BUILD_FEATURE
+  FIX_BUG
+  FIX_INCIDENT
+  SECURITY_PATCH
+  DEPENDENCY_UPDATE
+  REFACTOR
+  GENERATE_TESTS
+  REVIEW_PR
+  DEPLOY
+  ROLLBACK
+  ONBOARD_PROJECT
+  ONBOARD_DEVELOPER
+  ANALYZE_LOGS
+  CLASSIFY_ALERT
+  TRANSLATE_INTENT
+  UPDATE_DEBT_LEDGER
+  GENERATE_POSTMORTEM
+  COST_ANALYSIS
+}
+
+enum TaskPriority {
+  CRITICAL
+  HIGH
+  NORMAL
+  LOW
+}
+
+enum TaskStatus {
+  QUEUED
+  IN_PROGRESS
+  AWAITING_APPROVAL
+  APPROVED
+  REJECTED
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+enum AgentType {
+  BUILDER
+  WATCHER
+  FIXER
+  SECURITY
+  DEVOPS
+  INTENT
+  DEBT
+  ONBOARDING
+  ORCHESTRATOR
+}
+
+enum RequestedBy {
+  SYSTEM
+  FOUNDER
+  DEVELOPER
+  WEBHOOK
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  EXPIRED
+}
+
+enum RiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum IncidentSeverity {
+  CRITICAL
+  HIGH
+  MEDIUM
+  LOW
+}
+
+enum IncidentStatus {
+  OPEN
+  ACKNOWLEDGED
+  RESOLVED
+  CLOSED
+}
+
+enum DeployEnvironment {
+  PREVIEW
+  STAGING
+  PRODUCTION
+}
+
+enum DeployStatus {
+  PENDING
+  IN_PROGRESS
+  SUCCEEDED
+  FAILED
+  ROLLED_BACK
+}
+
+enum DebtType {
+  CODE_QUALITY
+  MISSING_TESTS
+  SECURITY
+  DEPENDENCY
+  ARCHITECTURE
+  DOCUMENTATION
+}
+
+enum DebtSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum SecurityScanType {
+  DEPENDENCY_AUDIT
+  SECRET_DETECTION
+  SAST
+  CONTAINER_SCAN
+  LICENSE_COMPLIANCE
+  CVE_WATCH
+  API_SECURITY
+}
+
+enum ScanStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+enum IntegrationType {
+  GITHUB
+  VERCEL
+  RAILWAY
+  RENDER
+  FLY
+  SENTRY
+  POSTHOG
+  DATADOG
+  LOGTAIL
+  CLOUDWATCH
+  SLACK
+  TELEGRAM
+  STRIPE
+}
+
+enum IntegrationStatus {
+  CONNECTED
+  NEEDS_ATTENTION
+  DISCONNECTED
+}
+
+enum AdrStatus {
+  PROPOSED
+  ACCEPTED
+  DEPRECATED
+  SUPERSEDED
+}

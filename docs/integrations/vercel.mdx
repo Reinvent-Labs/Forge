@@ -1,0 +1,83 @@
+---
+title: Vercel Integration
+description: Connect Vercel for automated deployments and rollbacks.
+---
+
+## What it enables
+
+- DevOps agent triggers production deployments after PR merges
+- Automatic rollback when a deployment causes error spikes
+- Deployment status shown in the dashboard
+- Preview deployments for every Forge PR
+
+## Setup
+
+### 1. Get your Vercel token
+
+Go to [vercel.com/account/tokens](https://vercel.com/account/tokens) and create a token.
+
+### 2. Find your project IDs
+
+```bash
+# Install Vercel CLI
+npm i -g vercel
+
+# List your projects
+vercel projects ls
+```
+
+### 3. Add to environment
+
+```bash
+VERCEL_TOKEN=your-token
+VERCEL_ORG_ID=team_xxxxxxxx
+VERCEL_PROJECT_ID=prj_xxxxxxxx
+```
+
+### 4. Configure webhook (optional)
+
+For faster deployment status updates, add a webhook in your Vercel project settings:
+
+```
+URL: https://your-forge-domain.com/webhooks/vercel
+Events: deployment.created, deployment.succeeded, deployment.error
+```
+
+## Deployment flow
+
+```
+PR merged to main
+      │
+      ▼
+DevOps agent triggers deploy
+      │
+      ▼
+Vercel builds + deploys
+      │
+      ▼
+DevOps watches for 10 min
+      │
+   ┌──┴──┐
+ Stable  Error spike
+   │        │
+ Done    Rollback
+```
+
+## Manual deployment
+
+Trigger a deployment from anywhere:
+
+```bash
+# CLI
+forge deploy
+
+# Dashboard
+Projects → [Project] → Deploy
+
+# Slack
+/forge deploy
+```
+
+## Preview deployments
+
+Every PR opened by Forge automatically gets a Vercel preview deployment. The preview URL is posted as a PR comment.

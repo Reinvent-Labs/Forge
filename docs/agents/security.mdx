@@ -1,0 +1,89 @@
+---
+title: Security Agent
+description: Scans for secrets, vulnerabilities, and code security issues on every push.
+---
+
+## What it does
+
+The Security agent runs automatically on every push to your main branch and on a daily schedule. It performs three types of scans:
+
+| Scan type | Tool | What it finds |
+|---|---|---|
+| Secret detection | Gitleaks | API keys, tokens, passwords committed to git |
+| SAST | Semgrep | Injection vulnerabilities, insecure patterns |
+| Dependency audit | npm audit | Known CVEs in your dependencies |
+
+## Severity levels
+
+| Level | Action |
+|---|---|
+| `CRITICAL` | Immediate Slack/Telegram alert + approval required to continue |
+| `HIGH` | Alert sent, fix queued within 24 hours |
+| `MEDIUM` | Weekly digest, fix queued |
+| `LOW` | Tracked in debt score, addressed in next sprint |
+
+## Secret exposure response
+
+When a secret is found in the git history, the Security agent follows a 6-step protocol:
+
+<Steps>
+  <Step title="Immediate alert">
+    Sends CRITICAL notification to all configured channels with the file path and secret type (never the secret value itself).
+  </Step>
+  <Step title="Revoke">
+    If the secret type is recognized (AWS, GitHub, Stripe, etc.), provides exact instructions to revoke it from the provider's dashboard.
+  </Step>
+  <Step title="Remove from history">
+    Opens a PR that removes the secret and adds it to `.gitignore`. Does NOT rewrite git history automatically (too destructive — requires manual action).
+  </Step>
+  <Step title="Add to env">
+    Suggests moving the value to `.env.local` and updates the code to read from `process.env`.
+  </Step>
+  <Step title="Scan for reuse">
+    Checks if the same value appears in other files.
+  </Step>
+  <Step title="Document">
+    Creates a `SecurityScan` record with full findings for audit purposes.
+  </Step>
+</Steps>
+
+## Security score
+
+The Security agent computes a score (0–100) for your project each week:
+
+```
+Score = (
+  (no critical findings)  × 40 +
+  (no high findings)      × 30 +
+  (dependency freshness)  × 20 +
+  (secrets clean)         × 10
+)
+```
+
+This score appears in the dashboard and is tracked over time in `ProjectMetricsSnapshot`.
+
+## Configuration
+
+```bash
+# Run frequency (cron syntax)
+SECURITY_SCAN_SCHEDULE="0 2 * * *"   # Daily at 2am
+
+# Gitleaks config file (optional custom rules)
+GITLEAKS_CONFIG=.gitleaks.toml
+
+# Semgrep ruleset
+SEMGREP_RULES=p/typescript,p/react,p/owasp-top-ten
+
+# Auto-create PRs for secret removal
+SECURITY_AUTO_PR=true
+```
+
+## Ignoring false positives
+
+Add a `.gitleaks.toml` to your repo root:
+
+```toml
+[[allowlist.regexes]]
+description = "Test fixtures — not real secrets"
+regex = '''AKIAIOSFODNN7EXAMPLE'''
+```

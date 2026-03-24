@@ -1,0 +1,37 @@
+{
+  "name": "@forge/orchestrator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Forge Agent Orchestrator — event bus, routing, context, approvals, confidence",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "typecheck": "tsc --noEmit",
+    "test": "jest"
+  },
+  "dependencies": {
+    "@forge/database": "*",
+    "@forge/shared": "*",
+    "bullmq": "^5.4.0",
+    "ioredis": "^5.3.0",
+    "fastify": "^4.26.0",
+    "@fastify/cors": "^9.0.0",
+    "@fastify/helmet": "^11.1.0",
+    "@fastify/jwt": "^8.0.0",
+    "@fastify/websocket": "^8.3.0",
+    "socket.io": "^4.7.0",
+    "zod": "^3.22.0",
+    "@anthropic-ai/sdk": "^0.27.0",
+    "openai": "^4.29.0",
+    "pino": "^8.19.0",
+    "pino-pretty": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.4.0"
+  }
+}

@@ -1,0 +1,78 @@
+---
+title: Metrics
+description: Understanding and ingesting metrics into the Forge dashboard.
+---
+
+## Built-in metrics
+
+Forge tracks the following metrics per project, stored in `ProjectMetricsSnapshot`:
+
+| Metric | Description |
+|---|---|
+| `activeUsers` | Unique active users in the last 24h |
+| `newSignups` | New registrations in the period |
+| `revenue` | MRR or daily revenue (if connected) |
+| `errorRate` | % of requests returning 5xx |
+| `p50Latency` | Median response time (ms) |
+| `p95Latency` | 95th percentile response time (ms) |
+| `p99Latency` | 99th percentile response time (ms) |
+| `uptimePercent` | Availability % |
+| `testCoverage` | % of code covered by tests |
+| `securityScore` | Security agent score (0–100) |
+| `debtScore` | Debt agent score (0–100) |
+| `openPrs` | Number of open pull requests |
+
+## Time ranges
+
+The metrics charts support three time ranges:
+- **7 days** — daily data points
+- **30 days** — daily data points
+- **90 days** — weekly aggregates
+
+## Ingesting real metrics
+
+### Option 1: API push
+
+Post metrics directly from your app or a cron job:
+
+```bash
+POST /api/projects/:id/metrics/ingest
+Authorization: Bearer <your-api-key>
+
+{
+  "errorRate": 0.02,
+  "p95Latency": 180,
+  "activeUsers": 142,
+  "uptimePercent": 99.9
+}
+```
+
+You only need to include the metrics you have — unspecified fields are not updated.
+
+### Option 2: Datadog integration
+
+```bash
+DATADOG_API_KEY=your-key
+DATADOG_APP_KEY=your-app-key
+DATADOG_METRICS_QUERY="avg:trace.web.request.errors{service:acme-app}"
+```
+
+Forge pulls metrics from Datadog every 5 minutes.
+
+### Option 3: Vercel Analytics
+
+```bash
+VERCEL_ANALYTICS_TOKEN=your-token
+```
+
+Forge reads web vitals and request latency from Vercel Analytics automatically.
+
+## Alerts
+
+The Watcher agent uses these metrics to trigger alerts. Configure thresholds in your project settings or environment:
+
+```bash
+WATCHER_ERROR_RATE_THRESHOLD=0.05
+WATCHER_P95_LATENCY_THRESHOLD=500
+WATCHER_UPTIME_THRESHOLD=99.0
+```

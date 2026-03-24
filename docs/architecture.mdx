@@ -1,0 +1,151 @@
+---
+title: Architecture
+description: How Forge's multi-agent system is structured, and how the pieces fit together.
+---
+
+## Overview
+
+Forge is a **monorepo** built on Turborepo. It consists of three layers:
+
+1. **Apps** — user-facing interfaces (dashboard, landing page)
+2. **Packages** — shared business logic (agents, database schema, orchestrator, CLI)
+3. **Infrastructure** — Docker services (Postgres, Redis, Grafana, Prometheus)
+
+```
+forge/
+├── apps/
+│   ├── dashboard/          # Next.js founder dashboard (port 3003)
+│   └── landing/            # Marketing site (port 3004)
+├── packages/
+│   ├── orchestrator/       # Agent runtime + HTTP API (port 4000)
+│   ├── agents/
+│   │   ├── watcher/        # Production monitoring
+│   │   ├── fixer/          # Bug detection + patching
+│   │   ├── builder/        # Feature implementation
+│   │   ├── security/       # Security scanning
+│   │   ├── devops/         # CI/CD + deployments
+│   │   ├── debt/           # Technical debt tracking
+│   │   └── onboarding/     # New project setup
+│   ├── database/           # Prisma schema + migrations
+│   └── cli/                # forge CLI tool
+└── infra/
+    ├── docker-compose.yml
+    ├── grafana/
+    └── prometheus/
+```
+
+## Agent Architecture
+
+Each agent is an **independent npm package** with a standard interface:
+
+```typescript
+interface AgentModule {
+  // Unique identifier
+  name: string
+
+  // What triggers this agent
+  triggers: AgentTrigger[]
+
+  // Main execution entry point
+  run(context: AgentContext): Promise<AgentResult>
+
+  // Cleanup resources on shutdown
+  destroy(): Promise<void>
+}
+```
+
+Agents communicate through the **Orchestrator**, never directly with each other. This keeps them loosely coupled and independently testable.
+
+<Frame>
+  ```
+  ┌─────────────────────────────────────────┐
+  │              Orchestrator               │
+  │                                         │
+  │  ┌──────────┐    ┌──────────────────┐  │
+  │  │  Router  │───▶│  Agent Registry  │  │
+  │  └──────────┘    └──────────────────┘  │
+  │        │                  │             │
+  │        ▼                  ▼             │
+  │  ┌──────────┐    ┌──────────────────┐  │
+  │  │ Job Queue│    │  Approval Queue  │  │
+  │  │ (Redis)  │    │  (Postgres)      │  │
+  │  └──────────┘    └──────────────────┘  │
+  └─────────────────────────────────────────┘
+         │
+         ▼
+  ┌─────────────┬──────────────┬──────────────┐
+  │   Watcher   │    Fixer     │   Builder    │
+  │   Agent     │    Agent     │   Agent      │
+  └─────────────┴──────────────┴──────────────┘
+  ```
+</Frame>
+
+## Data Flow
+
+### Incident Detection → Fix
+
+1. **Watcher** polls error rates every 5 minutes
+2. Threshold breached → Watcher creates an `Incident` record and emits an event
+3. **Orchestrator** routes the event to **Fixer**
+4. **Fixer** performs root-cause analysis using Claude
+5. Fixer generates a patch and opens a GitHub PR
+6. If `autonomyLevel = SEMI`, an **ApprovalRequest** is created
+7. Founder approves via Dashboard / Slack / Telegram
+8. **DevOps** agent merges and deploys
+
+### Approval System
+
+```
+Agent creates ApprovalRequest
+         │
+         ▼
+   Notification sent
+   (Slack / Telegram / Dashboard)
+         │
+    ┌────┴────┐
+    │ APPROVE │ ──▶ Agent executes action
+    │ REJECT  │ ──▶ Agent skips, logs reason
+    └─────────┘
+```
+
+## Autonomy Levels
+
+Each project has a configurable autonomy level:
+
+| Level | Behavior |
+|---|---|
+| `FULL` | Agents act immediately on all tasks |
+| `SEMI` | Low-risk tasks auto-execute, high-risk require approval |
+| `MANUAL` | All tasks require explicit approval |
+
+## LLM Integration
+
+Forge uses **Claude** (claude-sonnet-4-6) as the reasoning backbone for all agents. Each agent constructs a context-rich prompt with:
+
+- The relevant code files (via `codebaseContext`)
+- Recent incident history
+- Team conventions and tech stack
+- The specific task to complete
+
+Responses are parsed into **structured outputs** (Zod schemas) before any action is taken.
+
+## Database Schema
+
+Core entities and their relationships:
+
+```
+Organization
+  └── OrgMember (users)
+  └── Project
+        └── CodebaseContext
+        │     └── ModuleNode
+        ├── Incident
+        ├── DebtItem
+        ├── SecurityScan
+        ├── Deployment
+        ├── AgentTask
+        ├── ApprovalRequest
+        └── ProjectMetricsSnapshot
+```
+
+Full schema is defined in `packages/database/prisma/schema.prisma`.

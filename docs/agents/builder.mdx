@@ -1,0 +1,96 @@
+---
+title: Builder Agent
+description: Implements features from your backlog — writing code, tests, and documentation autonomously.
+---
+
+## What it does
+
+The Builder agent takes feature requests and implements them end-to-end:
+
+1. Reads the feature spec from the `AgentTask` queue
+2. Analyzes existing codebase patterns via `CodebaseContext`
+3. Plans the implementation (files to create/modify)
+4. Generates code following your project's conventions
+5. Writes tests for the new code
+6. Opens a PR with the implementation
+
+## Triggering the Builder
+
+### Via Dashboard
+Navigate to **Projects → [Your Project] → Tasks** and click **Request Feature**.
+
+### Via Slack
+```
+/forge build Add a CSV export button to the users table
+```
+
+### Via CLI
+```bash
+forge build "Add a CSV export button to the users table"
+```
+
+### Via API
+```bash
+POST /api/projects/:id/tasks
+{
+  "type": "FEATURE",
+  "description": "Add a CSV export button to the users table",
+  "priority": "MEDIUM"
+}
+```
+
+## How Builder uses your codebase
+
+Builder reads `CodebaseContext` to understand your project before writing anything:
+
+- **Tech stack** — which frameworks, patterns, and conventions to follow
+- **Module map** — which files exist and what they do
+- **Team conventions** — coding style, naming, file structure
+- **Test coverage** — which testing patterns are already in use
+
+This means generated code looks like it was written by a team member, not a generic AI.
+
+## Implementation planning
+
+Before writing code, Builder outputs a plan:
+
+```json
+{
+  "summary": "Add CSV export to the users table",
+  "filesToCreate": [
+    "src/lib/csv-export.ts",
+    "src/lib/csv-export.test.ts"
+  ],
+  "filesToModify": [
+    "src/app/users/page.tsx",
+    "src/app/api/users/export/route.ts"
+  ],
+  "estimatedComplexity": 3,
+  "breakingChanges": false
+}
+```
+
+In `SEMI` mode, this plan is sent for approval before any code is written.
+
+## Quality standards
+
+Builder enforces quality automatically:
+
+- TypeScript strict mode — no `any` types
+- Tests written alongside implementation
+- JSDoc comments on all exported functions
+- Follows existing patterns (if you use Zod for validation, Builder uses Zod)
+
+## Limitations
+
+Builder is best for:
+- CRUD features
+- UI components following existing patterns
+- API endpoints
+- Utility functions and helpers
+
+Builder is **not** suitable for:
+- Architectural changes (use it for implementation after you've designed)
+- Database migrations (requires manual review)
+- Changes to authentication or authorization logic
+- Features requiring external API credentials you haven't set up

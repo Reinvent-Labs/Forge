@@ -1,0 +1,60 @@
+---
+title: Dashboard Overview
+description: The Forge founder dashboard — your command center for all agent activity.
+---
+
+## What you see
+
+The dashboard gives you a real-time view of everything Forge is doing across your projects.
+
+<Frame>
+  ![Dashboard overview showing metrics, recent activity, and pending approvals](/images/dashboard-overview.png)
+</Frame>
+
+## Main sections
+
+### Health Score
+A composite 0–100 score calculated from:
+- **Uptime** (40%) — availability over the last 7 days
+- **Error rate** (30%) — inverse of current error rate
+- **Security** (20%) — Security agent score
+- **Debt** (10%) — inverse of debt score
+
+A score above 85 is healthy. Below 60 needs immediate attention.
+
+### Key Metrics
+Real-time stats at a glance:
+- Active users (last 24h)
+- New signups (last 7 days)
+- Error rate
+- p95 latency
+
+### Recent Activity
+A live feed of agent actions:
+- Incidents detected and resolved
+- PRs opened and merged
+- Deployments completed
+- Security scans run
+
+### Pending Approvals
+Actions waiting for your decision. Each card shows:
+- What the agent wants to do
+- Why it wants to do it
+- Risk level
+- One-click Approve / Reject
+
+## Navigation
+
+| Page | Path | Description |
+|---|---|---|
+| Overview | `/` | Health score + recent activity |
+| Incidents | `/incidents` | All incidents, open and resolved |
+| Deployments | `/deployments` | Deployment history + status |
+| Security | `/security` | Security scan results |
+| Debt | `/debt` | Technical debt breakdown |
+| Activity | `/activity` | Full agent task log |
+| Settings | `/settings` | Project and integration config |
+
+## Mobile
+
+The dashboard is fully responsive. On mobile, the sidebar collapses to a hamburger menu and all approval actions are touch-optimized (44px minimum tap targets).

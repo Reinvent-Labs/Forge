@@ -1,0 +1,79 @@
+---
+title: Introduction
+description: Forge is your autonomous AI CTO — monitoring production, fixing bugs, and shipping features while you focus on the business.
+---
+
+<img
+  className="block dark:hidden"
+  src="/images/hero-light.png"
+  alt="Forge Dashboard"
+/>
+<img
+  className="hidden dark:block"
+  src="/images/hero-dark.png"
+  alt="Forge Dashboard"
+/>
+
+## What is Forge?
+
+Forge is a multi-agent AI platform built for early-stage startups that don't have a full engineering team. It runs 24/7 in the background, autonomously handling the technical work so founders can focus on growth.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get Forge running locally in under 5 minutes
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/architecture">
+    Understand how the agent system is structured
+  </Card>
+  <Card title="Agents" icon="robot" href="/agents/overview">
+    Learn what each agent does and how to configure it
+  </Card>
+  <Card title="Integrations" icon="plug" href="/integrations/github">
+    Connect GitHub, Slack, Telegram, and Vercel
+  </Card>
+</CardGroup>
+
+## What Forge Does
+
+<AccordionGroup>
+  <Accordion icon="eye" title="Monitors production 24/7">
+    The **Watcher agent** continuously polls your error tracker, uptime monitor, and metrics. When something goes wrong — a spike in error rates, slow response times, a failed deployment — it detects it within minutes and triggers the right response agent.
+  </Accordion>
+  <Accordion icon="wrench" title="Fixes bugs autonomously">
+    The **Fixer agent** performs root-cause analysis, identifies the failing code, generates a patch, opens a PR, and notifies you for approval. Simple fixes ship without you touching the keyboard.
+  </Accordion>
+  <Accordion icon="hammer" title="Ships features on your roadmap">
+    The **Builder agent** takes feature requests from your backlog and implements them — writing code, tests, and documentation. You review and approve before anything merges.
+  </Accordion>
+  <Accordion icon="shield" title="Keeps your codebase secure">
+    The **Security agent** runs secret detection, SAST scans, and dependency audits on every push. Critical vulnerabilities are flagged immediately with plain-English explanations.
+  </Accordion>
+  <Accordion icon="chart-line" title="Tracks technical debt">
+    The **Debt agent** scores your codebase weekly, identifies the highest-risk areas, and queues up remediation tasks — prioritized by business impact.
+  </Accordion>
+</AccordionGroup>
+
+## The Approval Model
+
+Forge never acts unilaterally on high-impact changes. Every significant action — merging a PR, running a migration, changing infrastructure — goes through an **approval step**.
+
+You approve or reject in under 30 seconds via:
+- The **Forge dashboard**
+- A **Slack message** with one-click buttons
+- A **Telegram command**
+
+Low-risk actions (opening a PR, posting a comment, running a scan) execute automatically in `FULL` autonomy mode.
+
+## Key Principles
+
+<CardGroup cols={3}>
+  <Card title="Modular" icon="blocks">
+    Each agent is an independent package. Add, remove, or swap agents without touching the core orchestrator.
+  </Card>
+  <Card title="Observable" icon="telescope">
+    Every agent action is logged with full context — inputs, outputs, tool calls, tokens, and cost.
+  </Card>
+  <Card title="Safe" icon="lock">
+    Agents run in sandboxed environments. Production actions require explicit human approval.
+  </Card>
+</CardGroup>

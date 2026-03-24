@@ -1,0 +1,30 @@
+{
+  "name": "@forge/agent-fixer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Forge Fixer Agent — incident response and bug fixing",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@forge/database": "*",
+    "@forge/shared": "*",
+    "@forge/orchestrator": "*",
+    "anthropic": "^0.27.0",
+    "octokit": "^3.1.0",
+    "zod": "^3.22.0",
+    "pino": "^8.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0",
+    "@vitest/coverage-v8": "^1.6.0"
+  }
+}

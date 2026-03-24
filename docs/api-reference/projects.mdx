@@ -1,0 +1,109 @@
+---
+title: Projects
+description: Manage and query your Forge projects via the API.
+---
+
+## List projects
+
+```http
+GET /api/projects
+```
+
+Returns all projects for the authenticated user's organization.
+
+**Response:**
+```json
+[
+  {
+    "id": "clx1234...",
+    "name": "Acme App",
+    "slug": "acme-app",
+    "status": "ACTIVE",
+    "healthScore": 87,
+    "autonomyLevel": "SEMI",
+    "productionUrl": "https://app.acme.dev"
+  }
+]
+```
+
+---
+
+## Get project metrics
+
+```http
+GET /api/projects/:id/metrics?range=30d
+```
+
+**Query parameters:**
+
+| Parameter | Values | Default |
+|---|---|---|
+| `range` | `7d`, `30d`, `90d` | `30d` |
+
+**Response:**
+```json
+[
+  {
+    "capturedAt": "2024-01-15T00:00:00Z",
+    "activeUsers": 142,
+    "errorRate": 0.02,
+    "p95Latency": 185,
+    "uptimePercent": 99.9,
+    "securityScore": 92,
+    "debtScore": 78
+  }
+]
+```
+
+---
+
+## Get project health
+
+```http
+GET /api/projects/:id/health
+```
+
+Returns the computed health score and component breakdown.
+
+**Response:**
+```json
+{
+  "score": 87,
+  "components": {
+    "uptime": 40,
+    "errorRate": 28,
+    "security": 18,
+    "debt": 7
+  },
+  "trend": "improving"
+}
+```
+
+---
+
+## Ingest metrics
+
+```http
+POST /api/projects/:id/metrics/ingest
+```
+
+Push metrics from your application or monitoring tools.
+
+**Body:**
+```json
+{
+  "errorRate": 0.02,
+  "p50Latency": 85,
+  "p95Latency": 180,
+  "p99Latency": 320,
+  "activeUsers": 142,
+  "uptimePercent": 99.9
+}
+```
+
+All fields are optional. Only provided fields are updated.
+
+**Response:**
+```json
+{ "success": true }
+```

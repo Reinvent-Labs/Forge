@@ -1,0 +1,93 @@
+---
+title: Debt Agent
+description: Scores technical debt weekly and queues the highest-risk items for remediation.
+---
+
+## What it does
+
+The Debt agent runs weekly (or on-demand) and analyzes your codebase for technical debt. It produces:
+
+1. A **debt score** (0–100, higher = less debt)
+2. A prioritized list of `DebtItem` records
+3. A plain-English summary for the founder
+
+## Debt categories
+
+| Type | Description | Example |
+|---|---|---|
+| `MISSING_TESTS` | Code with low or no test coverage | Auth routes at 0% coverage |
+| `CODE_QUALITY` | Anti-patterns, complexity, dead code | Catch blocks that swallow errors |
+| `DEPENDENCY` | Outdated or vulnerable packages | next@14 when @15 is available |
+| `PERFORMANCE` | N+1 queries, unindexed columns, large bundles | Missing DB index on foreign key |
+| `SECURITY` | Hardcoded values, weak validation | No rate limiting on login endpoint |
+| `DOCUMENTATION` | Missing JSDoc, undocumented APIs | Public API with no types |
+
+## Severity vs business risk
+
+Each item is ranked by **business risk**, not just technical severity:
+
+```typescript
+{
+  type: 'MISSING_TESTS',
+  severity: 'HIGH',
+  filePath: 'src/app/api/auth/route.ts',
+  plainEnglishDescription: 'The login code has no automated tests',
+  businessRisk: 'Any change to auth could break login for all users',
+  estimatedHours: 8
+}
+```
+
+This means founders immediately understand why each item matters — not just that it's a problem.
+
+## Debt score formula
+
+```
+Score = 100
+  - (CRITICAL items × 20)
+  - (HIGH items × 10)
+  - (MEDIUM items × 5)
+  - (LOW items × 1)
+
+Clamped to [0, 100]
+```
+
+## Remediation queue
+
+High-severity debt items are automatically added to the Builder agent's queue:
+
+- `MISSING_TESTS` → Builder writes the missing tests
+- `DEPENDENCY` → DevOps agent opens dependency update PRs
+- `CODE_QUALITY` → Fixer agent refactors the flagged code
+
+All queued items appear as pending `ApprovalRequest`s in `SEMI` mode.
+
+## Weekly report
+
+Every Monday, the Debt agent sends a summary:
+
+```
+📊 Weekly Debt Report — Acme App
+
+Debt Score: 73/100 (▲ 4 from last week)
+
+New items this week:
+  🔴 HIGH   Missing tests in payment module
+  🟡 MEDIUM 3 dependencies outdated
+
+Resolved this week:
+  ✅ Auth route tests added (8h saved)
+  ✅ lodash updated to 4.17.21
+```
+
+## Configuration
+
+```bash
+# Run schedule (cron)
+DEBT_SCAN_SCHEDULE="0 9 * * MON"   # Every Monday at 9am
+
+# Auto-queue remediation tasks
+DEBT_AUTO_QUEUE=true
+
+# Minimum severity to auto-queue
+DEBT_AUTO_QUEUE_MIN_SEVERITY=HIGH
+```

@@ -1,0 +1,108 @@
+---
+title: Agents Overview
+description: Forge's seven specialized agents and how they work together.
+---
+
+## The Agent System
+
+Forge runs seven specialized agents, each responsible for a distinct domain. They are independent packages that communicate through the Orchestrator — meaning you can enable, disable, or replace any agent without affecting the others.
+
+<CardGroup cols={2}>
+  <Card title="Watcher" icon="eye" href="/agents/watcher">
+    Monitors production metrics, error rates, and uptime. The first line of defense.
+  </Card>
+  <Card title="Fixer" icon="wrench" href="/agents/fixer">
+    Performs root-cause analysis and generates patches for detected bugs.
+  </Card>
+  <Card title="Builder" icon="hammer" href="/agents/builder">
+    Implements features from your backlog — code, tests, and documentation.
+  </Card>
+  <Card title="Security" icon="shield" href="/agents/security">
+    Scans for secrets, vulnerabilities, and SAST issues on every push.
+  </Card>
+  <Card title="DevOps" icon="server" href="/agents/devops">
+    Manages deployments, rollbacks, and CI/CD pipeline health.
+  </Card>
+  <Card title="Debt" icon="chart-line" href="/agents/debt">
+    Scores technical debt weekly and queues remediation tasks.
+  </Card>
+  <Card title="Onboarding" icon="sparkles" href="/agents/onboarding">
+    Analyzes new repos, builds codebase context, and creates an initial roadmap.
+  </Card>
+</CardGroup>
+
+## Common Configuration
+
+All agents share a base configuration:
+
+```typescript
+interface AgentConfig {
+  // Anthropic API key
+  anthropicApiKey: string
+
+  // Database connection
+  databaseUrl: string
+
+  // Redis for job queues
+  redisUrl: string
+
+  // How aggressively to act without approval
+  autonomyLevel: 'FULL' | 'SEMI' | 'MANUAL'
+
+  // Notification channels
+  notifications: {
+    slack?: { webhookUrl: string; channel: string }
+    telegram?: { botToken: string; chatId: string }
+  }
+}
+```
+
+## Agent Lifecycle
+
+```
+1. Initialize    → Connect to DB, Redis, external APIs
+2. Register      → Tell Orchestrator what events trigger this agent
+3. Listen        → Wait for trigger events from the queue
+4. Execute       → Run the agent's core logic
+5. Report        → Write results to DB, send notifications
+6. Await         → If SEMI mode, wait for human approval
+7. Act           → Execute the approved action
+```
+
+## Adding a Custom Agent
+
+Create a new package in `packages/agents/`:
+
+```bash
+mkdir packages/agents/my-agent
+cd packages/agents/my-agent
+npm init -y
+```
+
+Implement the `AgentModule` interface:
+
+```typescript
+import { AgentContext, AgentResult } from '@forge/orchestrator'
+
+export class MyAgent {
+  name = 'my-agent'
+
+  async run(context: AgentContext): Promise<AgentResult> {
+    // Your agent logic here
+    return {
+      success: true,
+      summary: 'Did the thing',
+      actions: []
+    }
+  }
+}
+
+export const myAgent = new MyAgent()
+```
+
+Register in `packages/orchestrator/src/registry.ts`:
+
+```typescript
+import { myAgent } from '@forge/agent-my-agent'
+registry.register(myAgent)
+```

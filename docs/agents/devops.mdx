@@ -1,0 +1,92 @@
+---
+title: DevOps Agent
+description: Manages deployments, rollbacks, and CI/CD pipeline health.
+---
+
+## What it does
+
+The DevOps agent handles everything related to shipping code to production:
+
+- Monitors CI/CD pipeline status (GitHub Actions)
+- Triggers deployments to Vercel / Docker hosts
+- Rolls back automatically when a deployment causes a spike in errors
+- Reports deployment status to the dashboard and Slack
+
+## Deployment triggers
+
+A deployment is triggered when:
+- A PR is merged to `main` (via GitHub webhook)
+- The Builder or Fixer agent opens and merges a PR
+- A founder manually triggers via `forge deploy` or the dashboard
+
+## Automatic rollback
+
+After every deployment, the DevOps agent watches error rates for 10 minutes. If errors spike above the pre-deployment baseline, it rolls back automatically and creates an incident.
+
+```
+Deploy → Monitor 10 min
+               │
+    ┌──────────┴──────────┐
+    │                     │
+ Stable               Error spike
+    │                     │
+ ✓ Done           Rollback triggered
+                  Incident created
+                  Alert sent
+```
+
+## Vercel integration
+
+Configure your Vercel token and project IDs:
+
+```bash
+VERCEL_TOKEN=your-token
+VERCEL_ORG_ID=your-org-id
+VERCEL_PROJECT_ID=your-project-id
+```
+
+The DevOps agent can then:
+- Trigger production deployments
+- Check deployment status
+- Fetch deployment logs on failure
+- Roll back to a previous deployment
+
+## GitHub Actions integration
+
+DevOps reads your CI status via the GitHub API. It watches:
+- Build success/failure
+- Test pass rates
+- TypeScript type check results
+
+If CI fails on `main`, DevOps creates an incident and triggers Fixer.
+
+## Deployment record
+
+Every deployment is recorded:
+
+```typescript
+{
+  projectId: string
+  environment: 'PRODUCTION' | 'STAGING' | 'PREVIEW'
+  status: 'PENDING' | 'RUNNING' | 'SUCCEEDED' | 'FAILED' | 'ROLLED_BACK'
+  provider: 'vercel' | 'docker' | 'railway' | 'fly'
+  commitSha: string
+  commitMessage: string
+  branch: string
+  url: string
+  durationMs: number
+}
+```
+
+## Configuration
+
+```bash
+# Auto-rollback threshold (error rate delta)
+DEVOPS_ROLLBACK_THRESHOLD=0.10    # Roll back if errors increase by 10%
+
+# How long to watch after deploy before declaring it stable
+DEVOPS_WATCH_WINDOW_MS=600000     # 10 minutes
+
+# Staging deploy on every PR (not just main)
+DEVOPS_DEPLOY_PREVIEWS=true
+```

@@ -1,0 +1,112 @@
+# Deploy Dashboard to Vercel
+#
+# Triggered only when files under apps/dashboard/** change on pushes to main.
+# The `paths` filter prevents a docs change from triggering a dashboard deploy.
+#
+# Required repository secrets:
+#   VERCEL_TOKEN             — Vercel personal access token (Account Settings → Tokens)
+#   VERCEL_ORG_ID            — Found in Vercel project settings (e.g. team_xxxx)
+#   VERCEL_PROJECT_ID_DASHBOARD — The Vercel project ID for the dashboard app
+
+name: Deploy Dashboard
+
+on:
+  push:
+    branches:
+      - main
+    # Only run this workflow when dashboard source files change.
+    # Changes to unrelated packages (e.g. packages/orchestrator) won't trigger a deploy.
+    paths:
+      - "apps/dashboard/**"
+      # Also re-deploy if shared workspace packages that the dashboard depends on change
+      - "packages/shared/**"
+      - "packages/auth/**"
+      - "packages/database/**"
+      # Re-deploy when the workflow itself is updated
+      - ".github/workflows/deploy-dashboard.yml"
+
+# Prevent concurrent deploys — if a second push lands while a deploy is in
+# flight, cancel the older run to avoid deploying a stale build.
+concurrency:
+  group: deploy-dashboard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Build & Deploy to Vercel
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # Restore Turbo cache so the build step can skip unchanged packages
+      - name: Restore Turbo cache
+        uses: actions/cache@v4
+        with:
+          path: .turbo
+          key: turbo-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            turbo-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Build the dashboard app through Turborepo so upstream package builds
+      # (e.g. packages/shared) are resolved in dependency order.
+      - name: Build dashboard
+        working-directory: apps/dashboard
+        run: npm run build
+        env:
+          # Suppress Next.js telemetry in CI
+          NEXT_TELEMETRY_DISABLED: 1
+
+      # Install the Vercel CLI to get access to `vercel deploy` and project linking.
+      - name: Install Vercel CLI
+        run: npm install --global vercel@latest
+
+      # Pull the Vercel project configuration (vercel.json, env vars, etc.)
+      # from the Vercel platform so the CLI knows which project to deploy to.
+      - name: Pull Vercel project settings
+        working-directory: apps/dashboard
+        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID_DASHBOARD }}
+
+      # Build on Vercel's side (produces the deployment artifact).
+      # We pass --prebuilt because we already ran `next build` above;
+      # Vercel will reuse the .next output instead of building again.
+      - name: Deploy to Vercel (production)
+        id: deploy
+        working-directory: apps/dashboard
+        run: |
+          # Deploy and capture the deployment URL written to stdout
+          DEPLOYMENT_URL=$(vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }} 2>&1 | tail -n1)
+          echo "deployment_url=${DEPLOYMENT_URL}" >> "$GITHUB_OUTPUT"
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID_DASHBOARD }}
+
+      # Write a human-readable summary to the GitHub Actions job summary page.
+      # This appears on the workflow run page and makes it easy to click through.
+      - name: Write job summary
+        run: |
+          echo "## Dashboard Deployment" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Status | Deployed |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| URL | ${{ steps.deploy.outputs.deployment_url }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Commit | \`${{ github.sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Triggered by | @${{ github.actor }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "[Open Dashboard](${{ steps.deploy.outputs.deployment_url }})" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,91 @@
+---
+title: Slack Integration
+description: Get alerts and approve agent actions directly from Slack.
+---
+
+## What it enables
+
+- Receive production alerts with context
+- Approve or reject agent actions with one click
+- Ask Forge questions using slash commands
+- Get weekly digest reports
+
+## Setup
+
+### 1. Create a Slack app
+
+Go to [api.slack.com/apps](https://api.slack.com/apps) and create a new app **From scratch**.
+
+### 2. Configure the app
+
+Under **OAuth & Permissions**, add these bot token scopes:
+
+```
+chat:write
+commands
+incoming-webhook
+```
+
+Under **Incoming Webhooks**, enable and create a webhook for your alerts channel.
+
+Under **Slash Commands**, create:
+```
+/forge — Send commands to Forge
+```
+
+### 3. Add to environment
+
+```bash
+SLACK_BOT_TOKEN=xoxb-your-bot-token
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
+SLACK_CHANNEL=#forge-alerts
+```
+
+### 4. Set request URL for slash commands
+
+```
+https://your-forge-domain.com/webhooks/slack
+```
+
+## Alert format
+
+```
+🚨 Production Alert — Acme App
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Error rate is at 12% (threshold: 5%)
+Affected users: ~47
+
+Forge is analyzing the root cause...
+
+[View in Dashboard →]
+```
+
+## Approval messages
+
+```
+🔧 Approval Required
+
+Action: Merge PR #47 — Fix null pointer in auth module
+Risk: 🟢 LOW
+
+Root Cause:
+The session refresh function doesn't guard against
+undefined before accessing user.id, causing crashes
+for 8% of users on slow connections.
+
+Changes: 3 lines in src/app/api/auth/route.ts
+
+[✅ Approve]   [❌ Reject]   [View PR →]
+```
+
+## Slash commands
+
+| Command | Description |
+|---|---|
+| `/forge status` | Show health score and recent activity |
+| `/forge incidents` | List open incidents |
+| `/forge approve <id>` | Approve a pending action |
+| `/forge reject <id>` | Reject a pending action |
+| `/forge build <description>` | Queue a feature request |
+| `/forge deploy` | Trigger a production deployment |

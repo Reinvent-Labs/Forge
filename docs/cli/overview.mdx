@@ -1,0 +1,40 @@
+---
+title: CLI Overview
+description: The forge command-line tool for interacting with Forge from your terminal.
+---
+
+## Installation
+
+```bash
+npm install -g @forge/cli
+```
+
+Or run without installing:
+
+```bash
+npx @forge/cli <command>
+```
+
+## Authentication
+
+```bash
+forge login
+```
+
+This opens a browser window to authenticate with your Forge account and saves a token to `~/.forge/credentials.json`.
+
+## Quick reference
+
+```bash
+forge init              # Set up Forge in the current project
+forge connect github    # Connect a GitHub repository
+forge connect slack     # Connect a Slack workspace
+forge connect telegram  # Connect a Telegram bot
+forge status            # Show current health score and open incidents
+forge logs              # Stream agent activity logs
+forge deploy            # Trigger a production deployment
+forge approve           # Interactively approve pending actions
+forge build <feature>   # Queue a feature request
+```
+
+Full command reference: [CLI Commands →](/cli/commands)

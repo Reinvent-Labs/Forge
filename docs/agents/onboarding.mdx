@@ -1,0 +1,98 @@
+---
+title: Onboarding Agent
+description: Analyzes a new repository, builds codebase context, and creates an initial improvement roadmap.
+---
+
+## What it does
+
+The Onboarding agent runs once when you connect a new project to Forge. It:
+
+1. Clones your repository
+2. Analyzes every file to build a `CodebaseContext`
+3. Maps the module graph (which files depend on what)
+4. Identifies the tech stack, testing patterns, and conventions
+5. Runs an initial security scan and debt assessment
+6. Generates a **Forge Kickoff Report** with prioritized improvements
+
+## Kickoff Report
+
+The report is delivered to your dashboard and Slack/Telegram:
+
+```
+🚀 Forge Kickoff Report — Acme App
+
+Codebase Summary
+  Language:     TypeScript
+  Framework:    Next.js 14
+  Database:     PostgreSQL (Prisma)
+  Tests:        Jest — 23% coverage
+  Modules:      47 files analyzed
+
+Immediate Concerns
+  🔴 CRITICAL  No secrets scanning configured
+  🔴 HIGH      Auth module has 0% test coverage
+  🟡 MEDIUM    3 dependencies with known CVEs
+
+Quick Wins (< 2 hours each)
+  1. Add .gitleaks.toml to prevent secret commits
+  2. Set up GitHub Actions CI (template ready)
+  3. Add Zod validation to the /api/users endpoint
+
+This Week
+  1. Write tests for auth module (8h)
+  2. Update vulnerable dependencies (2h)
+  3. Add rate limiting to public API endpoints (4h)
+
+Forge has queued these as tasks. Approve to start.
+```
+
+## Codebase context
+
+The context built by Onboarding powers every other agent. Without accurate context, Fixer and Builder generate poor-quality code. The Onboarding agent captures:
+
+```typescript
+{
+  techStack: {
+    language: 'TypeScript',
+    framework: 'Next.js 14',
+    database: 'PostgreSQL',
+    testFramework: 'Jest',
+    packageManager: 'npm'
+  },
+  teamMembers: [...],
+  moduleNodes: [
+    {
+      path: 'src/app/api/auth/route.ts',
+      plainEnglishDescription: 'Handles login, signup, and token refresh',
+      complexityScore: 8,
+      testCoverage: 0,
+      lastModifiedBy: 'alex'
+    }
+  ]
+}
+```
+
+## Re-running onboarding
+
+You can refresh the codebase context at any time:
+
+```bash
+forge onboard --refresh
+```
+
+Or from the dashboard: **Settings → Codebase → Refresh Context**
+
+This is useful after a major refactor or when you add a significant new module.
+
+## Configuration
+
+```bash
+# Depth of dependency graph analysis
+ONBOARDING_GRAPH_DEPTH=3
+
+# File patterns to exclude from analysis
+ONBOARDING_EXCLUDE=node_modules/**,*.test.ts,*.spec.ts
+
+# Auto-queue kickoff report tasks
+ONBOARDING_AUTO_QUEUE=true
+```

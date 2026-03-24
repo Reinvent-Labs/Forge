@@ -1,0 +1,76 @@
+---
+title: Watcher Agent
+description: Continuously monitors production health and triggers response agents when thresholds are breached.
+---
+
+## What it does
+
+The Watcher agent is Forge's eyes on production. It runs on a configurable polling interval (default: 5 minutes) and checks:
+
+- **Error rate** — percentage of requests returning 5xx errors
+- **Latency** — p50, p95, p99 response times
+- **Uptime** — availability percentage
+- **Deployment health** — status of recent deployments
+
+When a threshold is breached, Watcher creates an `Incident` record and emits an event to the Orchestrator, which routes it to the appropriate response agent (usually Fixer or DevOps).
+
+## Configuration
+
+```typescript
+// packages/orchestrator/.env
+WATCHER_POLL_INTERVAL_MS=300000   # 5 minutes (default)
+WATCHER_ERROR_RATE_THRESHOLD=0.05 # 5% error rate triggers alert
+WATCHER_P95_LATENCY_THRESHOLD=500 # 500ms p95 triggers alert
+WATCHER_UPTIME_THRESHOLD=99.0     # Below 99% triggers alert
+```
+
+## Thresholds
+
+| Metric | Default Threshold | Severity |
+|---|---|---|
+| Error rate | > 5% | HIGH |
+| Error rate | > 15% | CRITICAL |
+| p95 latency | > 500ms | MEDIUM |
+| p95 latency | > 2000ms | HIGH |
+| Uptime | < 99% | HIGH |
+| Uptime | < 95% | CRITICAL |
+| Failed deployment | any | HIGH |
+
+## Incident Creation
+
+When a threshold is breached, Watcher creates a structured incident:
+
+```typescript
+{
+  projectId: string
+  title: string           // e.g. "Error rate spike: 12% (threshold: 5%)"
+  description: string     // Plain-English summary for the founder
+  severity: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
+  status: 'OPEN'
+  affectedModules: string[]
+  affectedUsers: number
+  detectedAt: Date
+}
+```
+
+## Notifications
+
+In `SEMI` or `MANUAL` autonomy mode, Watcher sends an immediate notification before handing off to Fixer:
+
+```
+🚨 Production Alert — Acme App
+
+Error rate is at 12% (threshold: 5%)
+Affected users: ~47
+
+Forge is analyzing the root cause...
+You'll receive an update with a proposed fix shortly.
+```
+
+## Data sources
+
+Watcher reads metrics from `ProjectMetricsSnapshot` records written by your integrations. To feed real data in, connect:
+
+- **Datadog** — via the Datadog API integration
+- **Sentry** — via the Sentry webhook integration
+- **Custom** — POST to `/api/projects/:id/metrics/ingest`

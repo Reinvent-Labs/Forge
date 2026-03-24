@@ -1,0 +1,217 @@
+# CI Pipeline for the Forge monorepo
+#
+# Runs typecheck, lint, and test in parallel on every push/PR to main.
+# The build job is gated to push-to-main only to conserve CI minutes on PRs.
+#
+# Service containers (Postgres + Redis) are scoped to the `test` job only
+# because the other jobs don't need live database or cache connections.
+
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+# Cancel in-progress runs on the same branch/PR when a new commit is pushed.
+# This prevents redundant work while keeping the latest run alive.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Turbo remote cache token (optional — set in repo secrets to enable remote caching)
+  TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+  TURBO_TEAM: ${{ secrets.TURBO_TEAM }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # TYPECHECK
+  # Verifies TypeScript compilation across the entire monorepo via Turborepo.
+  # ---------------------------------------------------------------------------
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history so Turbo can diff against base branches
+          fetch-depth: 2
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          # Use npm's built-in caching for node_modules
+          cache: npm
+
+      # Restore the Turbo build cache so unchanged packages are skipped
+      - name: Restore Turbo cache
+        uses: actions/cache@v4
+        with:
+          path: .turbo
+          # Key includes the commit SHA so each push gets a fresh write slot;
+          # restore-keys fall back to the most recent cache from any previous run.
+          key: turbo-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            turbo-${{ runner.os }}-
+
+      - name: Install dependencies
+        # `npm ci` is preferred over `npm install` in CI: it is faster,
+        # reproducible (uses package-lock.json exactly), and fails on drift.
+        run: npm ci
+
+      - name: Run typecheck
+        run: npx turbo typecheck
+
+  # ---------------------------------------------------------------------------
+  # LINT
+  # Runs ESLint / next lint across all workspaces that define a lint script.
+  # Turborepo skips packages that don't have the task defined, so this is safe.
+  # ---------------------------------------------------------------------------
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Restore Turbo cache
+        uses: actions/cache@v4
+        with:
+          path: .turbo
+          key: turbo-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            turbo-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run lint
+        # Turborepo only runs `lint` in packages that have the script defined.
+        # apps/dashboard has `next lint`; other packages may add lint later.
+        run: npx turbo lint
+
+  # ---------------------------------------------------------------------------
+  # TEST
+  # Runs the Jest/Vitest suites across all packages.
+  # Requires live Postgres 16 and Redis 7 service containers.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    # Service containers are started before the job steps and torn down after.
+    # They are accessible at localhost:<port> from within the runner.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: forge
+          POSTGRES_PASSWORD: password
+          POSTGRES_DB: forge
+        ports:
+          - 5432:5432
+        # Wait until Postgres is accepting connections before proceeding
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # These env vars are injected into the test process so packages that
+      # read DATABASE_URL / REDIS_URL at test time connect to the service containers.
+      DATABASE_URL: postgresql://forge:password@localhost:5432/forge
+      REDIS_URL: redis://localhost:6379
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Restore Turbo cache
+        uses: actions/cache@v4
+        with:
+          path: .turbo
+          key: turbo-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            turbo-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npx turbo test
+
+  # ---------------------------------------------------------------------------
+  # BUILD
+  # Builds the full monorepo (Next.js apps + compiled packages).
+  # Only runs on push to main — skipped on pull_request events.
+  # This prevents PRs from burning CI minutes on production builds while still
+  # verifying every merge commit is buildable before it reaches staging/prod.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    # Gate: only run when a commit is pushed to main (not on pull_request triggers)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Ensure typecheck and lint pass before building to get fast feedback
+    needs: [typecheck, lint]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Restore Turbo cache
+        uses: actions/cache@v4
+        with:
+          path: .turbo
+          # On main, write a fresh cache entry keyed by SHA so deploy workflows
+          # that run after CI can restore a warm Turbo cache.
+          key: turbo-${{ runner.os }}-${{ github.sha }}
+          restore-keys: |
+            turbo-${{ runner.os }}-
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build all packages and apps
+        run: npx turbo build
