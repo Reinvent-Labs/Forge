@@ -4,6 +4,21 @@
 
 Forge is a production-grade, multi-agent platform that gives non-technical founders a complete technical co-founder as infrastructure: it builds applications, monitors production, fixes bugs autonomously, manages security, and surfaces everything through a founder-friendly dashboard.
 
+<div align="center">
+  <a href="https://forge.reinvent-labs.com" target="_blank">
+    <img src="apps/landing/public/favicon.svg" width="64" height="64" alt="Forge Logo">
+  </a>
+</div>
+
+<div align="center" style="margin: 20px 0;">
+  <a href="https://forge.reinvent-labs.com" target="_blank" style="background: #22c55e; color: white; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: bold; margin: 0 10px; display: inline-block;">
+    🔥 Launch Forge App
+  </a>
+  <a href="https://github.com/Reinvent-Labs/Forge" target="_blank" style="background: #18181b; color: white; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: bold; margin: 0 10px; display: inline-block; border: 1px solid #3f3f46;">
+    📄 View Documentation
+  </a>
+</div>
+
 ---
 
 ## Architecture
