@@ -12,6 +12,9 @@ export const metadata: Metadata = {
   title: "Forge — Your AI CTO",
   description:
     "Forge is your AI CTO — monitoring your startup, fixing bugs, and shipping features around the clock so you can focus on what matters.",
+  icons: {
+    icon: "/favicon.svg",
+  },
   keywords: [
     "AI CTO",
     "startup automation",
