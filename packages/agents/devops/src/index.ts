@@ -1,894 +1,2848 @@
 /**
- * @forge/agent-devops
+ * @forge/agent-devops - DevOps Agent
  *
- * DevOps Agent: deployment orchestration, rollback, cost analysis,
- * auto-rollback triggers, and deployment promotion rules.
- *
- * Design principles:
- *  - Deployments are recorded before they start so a partial failure
- *    always leaves an audit trail.
- *  - Auto-rollback is triggered on hard metrics thresholds, never on
- *    guesses. The cause and timeline are always included in the alert.
- *  - Promotion to production is blocked during Friday 3pm - Monday 9am UTC.
- *  - Cost spike alerts include a human-readable projection, not just
- *    a raw percentage.
+ * Orchestrates production-safe deployments with:
+ * - Multi-platform deploy APIs (Vercel, Railway, Fly.io)
+ * - Staged rollout flow (preview -> staging -> production)
+ * - Confidence-based promotion and approval gating
+ * - Post-deploy health monitoring with automatic rollback
+ * - Deployment duration and per-platform cost tracking
+ * - Deployment freeze windows (weekends + late Friday)
+ * - Optional DNS updates after successful production deployment
  */
 
+import { randomUUID } from 'crypto'
 import { createLogger, createContextLogger } from '@forge/shared'
-import type { AgentTask, DeploymentRecord, CostRecord, CostAnomaly, TimeWindow } from '@forge/shared'
+import type {
+  AgentTask,
+  ConfidenceRecommendation,
+  ConfidenceScore,
+  CostAnomaly,
+  CostRecord,
+  TimeWindow,
+} from '@forge/shared'
 import { prisma } from '@forge/database'
+import { ConfidenceEngine } from '@forge/orchestrator'
+import type { ConfidenceInputs } from '@forge/orchestrator'
+import { ApprovalGateway } from '@forge/orchestrator'
 
-const log = createLogger('devops-agent')
+const log = createLogger('agent-devops')
 
-// ---------------------------------------------------------------------------
-// Types and interfaces
-// ---------------------------------------------------------------------------
+const DAY_MS = 24 * 60 * 60 * 1000
+const API_TIMEOUT_MS = 20_000
 
-/** Supported deployment providers. */
-export type DeployProvider = 'vercel' | 'railway' | 'render' | 'fly'
+const DEPLOY_PROVIDERS = ['vercel', 'railway', 'fly'] as const
+const DEPLOY_ENVIRONMENTS = ['preview', 'staging', 'production'] as const
 
-/** An environment in the deployment pipeline. */
-export interface Environment {
-  name: 'preview' | 'staging' | 'production'
+const DEFAULT_BLOCKED_TIME_WINDOWS: TimeWindow[] = [
+  { dayOfWeek: [5], startHour: 15, endHour: 24 },
+  { dayOfWeek: [6], startHour: 0, endHour: 24 },
+  { dayOfWeek: [0], startHour: 0, endHour: 24 },
+]
+
+const DEFAULT_ROLLBACK_CONFIG: RollbackConfig = {
+  errorRateMultiplierThreshold: 1.5,
+  p99LatencyMultiplierThreshold: 2.0,
+  healthCheckFailureThreshold: 3,
+  observationWindowMinutes: 10,
+  healthCheckIntervalMs: 30_000,
+}
+
+const DEFAULT_PROMOTION_GATES: PromotionGates = {
+  minStagingMinutes: 0,
+  maxErrorRateDelta: 0.2,
+  minConfidenceScore: 65,
+}
+
+const DEFAULT_PROVIDER_COST_RATES_USD_PER_MINUTE: Record<DeployProvider, number> = {
+  vercel: 0.024,
+  railway: 0.03,
+  fly: 0.022,
+}
+
+/** Supported deployment providers for this agent. */
+export type DeployProvider = (typeof DEPLOY_PROVIDERS)[number]
+
+/** Rollout environments in promotion order. */
+export type DeployEnvironmentName = (typeof DEPLOY_ENVIRONMENTS)[number]
+
+/** DNS provider choices for post-deploy updates. */
+export type DnsProvider = 'vercel' | 'cloudflare'
+
+/**
+ * Environment-specific deployment configuration.
+ */
+export interface EnvironmentConfig {
+  name: DeployEnvironmentName
   provider: DeployProvider
-  /** Provider-specific identifier (Vercel project ID, Railway service ID, etc.). */
-  providerId: string
+  providerProjectId: string
+  token: string
   url?: string
+  teamId?: string
+  serviceId?: string
+  environmentId?: string
+  appName?: string
+  costRateUsdPerMinute?: number
 }
 
 /**
- * Conditions that must all be satisfied before promoting from staging/preview
- * to production. A single failing condition blocks promotion.
+ * Automatic rollback trigger configuration.
  */
-export interface PromotionRule {
-  from: 'staging' | 'preview'
-  to: 'production'
-  conditions: {
-    /** Minimum minutes the build must have been live on staging. */
-    minStagingAge: number
-    /** Maximum allowed increase in error rate vs production baseline (0-1). */
-    maxErrorRateDelta: number
-    /** All CI checks must be green before promotion. */
-    ciMustPass: boolean
-    /** No open critical/high security findings. */
-    securityMustPass: boolean
-    /** Minimum confidence score (0-100) required for auto-promotion. */
-    confidenceMinScore: number
-    /** When true, human approval is required regardless of other conditions. */
-    requireApproval: boolean
-    /** Time windows during which promotion is blocked. */
-    blockedTimeWindows: TimeWindow[]
-  }
-}
-
-/** Configuration for automatic rollback. */
 export interface RollbackConfig {
-  /** Error rate increase (as a multiplier) that triggers rollback. Default: 1.5 (150%). */
+  /** Roll back when current error rate / baseline exceeds this multiplier. */
   errorRateMultiplierThreshold: number
-  /** p99 latency increase multiplier that triggers rollback. Default: 3.0 (300%). */
+  /** Roll back when current p99 / baseline exceeds this multiplier. */
   p99LatencyMultiplierThreshold: number
-  /** Number of consecutive failed health checks before rollback. Default: 3. */
+  /** Number of consecutive failed health checks to treat as unhealthy. */
   healthCheckFailureThreshold: number
-  /** Observation window in minutes after deploy. Default: 10. */
+  /** Minutes to observe after production deploy for degradation. */
   observationWindowMinutes: number
+  /** Poll interval used during post-deploy monitoring. */
+  healthCheckIntervalMs: number
 }
 
-/** Full deployment pipeline configuration for a project. */
+/**
+ * Promotion gate thresholds checked before production promotion.
+ */
+export interface PromotionGates {
+  /** Minimum required staging age (minutes) before production promotion. */
+  minStagingMinutes: number
+  /** Maximum allowed relative error-rate increase (e.g. 0.2 = +20%). */
+  maxErrorRateDelta: number
+  /** Minimum confidence score required to proceed. */
+  minConfidenceScore: number
+}
+
+/**
+ * Internal deployment pipeline resolved from project config + task payload.
+ */
 export interface DeploymentPipeline {
   projectId: string
-  environments: Environment[]
-  promotionRules: PromotionRule[]
+  provider: DeployProvider
+  environments: Record<DeployEnvironmentName, EnvironmentConfig>
+  blockedTimeWindows: TimeWindow[]
   rollbackConfig: RollbackConfig
+  promotionGates: PromotionGates
 }
 
-/** Top-level result envelope returned by handleTask(). */
+/**
+ * DNS record mutation request.
+ */
+export interface DnsRecordChange {
+  type: 'A' | 'AAAA' | 'CNAME'
+  name: string
+  value: string
+  ttl?: number
+  proxied?: boolean
+}
+
+/**
+ * DNS update configuration for post-production promotion.
+ */
+export interface DnsUpdateConfig {
+  provider?: DnsProvider
+  token?: string
+  zoneId?: string
+  projectId?: string
+  records: DnsRecordChange[]
+}
+
+/**
+ * Optional provider-level overrides supplied in task payload.
+ */
+export interface ProviderConfigOverride {
+  token?: string
+  projectId?: string
+  previewProjectId?: string
+  stagingProjectId?: string
+  productionProjectId?: string
+  teamId?: string
+  serviceId?: string
+  previewEnvironmentId?: string
+  stagingEnvironmentId?: string
+  productionEnvironmentId?: string
+  appName?: string
+  costRateUsdPerMinute?: number
+}
+
+/**
+ * Optional environment-level overrides supplied in task payload.
+ */
+export interface EnvironmentConfigOverride {
+  token?: string
+  projectId?: string
+  providerProjectId?: string
+  teamId?: string
+  serviceId?: string
+  environmentId?: string
+  appName?: string
+  url?: string
+  costRateUsdPerMinute?: number
+}
+
+/**
+ * Deploy payload accepted by triggerDeploy.
+ */
+export interface DeployTaskPayload {
+  action?: 'deploy' | 'rollback' | 'cost_analysis' | 'health_check'
+  environment: DeployEnvironmentName
+  provider?: DeployProvider
+  commitSha?: string
+  commitMessage?: string
+  branch?: string
+  changedFiles?: string[]
+  ciPassing?: boolean
+  ciCoverage?: number
+  securityScanPassed?: boolean
+  blockedTimeWindows?: TimeWindow[]
+  overrideFrozenWindow: boolean
+  forceApproval: boolean
+  minStagingMinutes?: number
+  maxErrorRateDelta?: number
+  confidenceMinScore?: number
+  rollbackConfig?: Partial<RollbackConfig>
+  providers?: Partial<Record<DeployProvider, ProviderConfigOverride>>
+  environments?: Partial<Record<DeployEnvironmentName, EnvironmentConfigOverride>>
+  dns?: DnsUpdateConfig
+}
+
+/**
+ * Rollback payload accepted by triggerRollback.
+ */
+export interface RollbackTaskPayload {
+  environment: DeployEnvironmentName
+  provider?: DeployProvider
+  reason: string
+  rollbackToDeploymentId?: string
+  excludeDeploymentId?: string
+  automatic: boolean
+  providers?: Partial<Record<DeployProvider, ProviderConfigOverride>>
+  environments?: Partial<Record<DeployEnvironmentName, EnvironmentConfigOverride>>
+}
+
+/**
+ * Cost analysis payload accepted by analyzeCosts.
+ */
+export interface CostAnalysisPayload {
+  lookbackDays: number
+}
+
+/**
+ * Per-provider cost totals.
+ */
+export interface ProviderCostBreakdown {
+  vercel: number
+  railway: number
+  fly: number
+}
+
+/**
+ * Single stage rollout result.
+ */
+export interface StageDeployResult {
+  deploymentId: string
+  projectId: string
+  environment: DeployEnvironmentName
+  provider: DeployProvider
+  status: 'pending' | 'in_progress' | 'succeeded' | 'failed' | 'rolled_back'
+  startedAt: Date
+  completedAt: Date
+  durationMs: number
+  estimatedCostUsd: number
+  summary: string
+  url?: string
+  commitSha?: string
+  externalId?: string
+  rollbackReason?: string
+  dnsUpdated?: boolean
+}
+
+/**
+ * Result returned by deploy/rollback operations.
+ */
+export interface DeployResult {
+  deploymentId: string
+  projectId: string
+  environment: DeployEnvironmentName
+  provider: DeployProvider
+  status: 'pending' | 'in_progress' | 'succeeded' | 'failed' | 'rolled_back'
+  startedAt: Date
+  completedAt: Date
+  summary: string
+  url?: string
+  commitSha?: string
+  confidenceScore?: ConfidenceScore
+  totalCostUsd?: number
+  approvalRequested?: boolean
+  dnsUpdated?: boolean
+  stageResults: StageDeployResult[]
+}
+
+/**
+ * Top-level result envelope returned by handleTask.
+ */
 export interface DevOpsResult {
   taskId: string
   projectId: string
   action: 'deploy' | 'rollback' | 'cost_analysis' | 'health_check'
   success: boolean
+  completedAt: Date
   error?: string
+  approvalRequested?: boolean
   deployResult?: DeployResult
   costRecord?: CostRecord
-  completedAt: Date
+  platformCosts?: ProviderCostBreakdown
 }
 
-/** Result of triggerDeploy() or triggerRollback(). */
-export interface DeployResult {
-  deploymentId: string
-  projectId: string
-  environment: string
-  provider: DeployProvider
-  status: 'pending' | 'in_progress' | 'succeeded' | 'failed' | 'rolled_back'
-  url?: string
-  commitSha?: string
-  startedAt: Date
-  completedAt?: Date
-  /** Human-readable summary of what happened. */
-  summary: string
-}
-
-/** Health check result from the deployed service. */
+/**
+ * Result of a health check pass.
+ */
 interface HealthCheckResult {
   healthy: boolean
   statusCode: number
   latencyMs: number
   checkedAt: Date
+  failures: number
 }
 
-/** Post-deploy metrics snapshot for rollback evaluation. */
+/**
+ * Normalized metrics snapshot used for rollback checks.
+ */
 interface MetricsSnapshot {
   errorRate: number
   p99LatencyMs: number
   capturedAt: Date
 }
 
-// ---------------------------------------------------------------------------
-// DevOpsAgent
-// ---------------------------------------------------------------------------
+/**
+ * Provider deploy API response.
+ */
+interface ProviderDeployResponse {
+  externalId?: string
+  url?: string
+}
 
 /**
- * DevOps Agent for the Forge platform.
- *
- * Responsibilities:
- * 1. Trigger deployments on Vercel / Railway / Render / Fly.io.
- * 2. Monitor post-deploy health and auto-rollback on threshold breach.
- * 3. Enforce promotion rules (staging age, CI, security, time windows).
- * 4. Analyse infrastructure costs and surface anomalies.
+ * Runtime dependencies for easier unit testing.
+ */
+export interface DevOpsAgentDependencies {
+  confidenceEngine?: Pick<ConfidenceEngine, 'compute'>
+  approvalGateway?: Pick<ApprovalGateway, 'createApproval'>
+  fetchImpl?: typeof fetch
+  now?: () => Date
+  sleepFn?: (ms: number) => Promise<void>
+}
+
+class ApprovalRequiredError extends Error {
+  readonly confidenceScore: ConfidenceScore
+
+  constructor(message: string, confidenceScore: ConfidenceScore) {
+    super(message)
+    this.name = 'ApprovalRequiredError'
+    this.confidenceScore = confidenceScore
+  }
+}
+
+/**
+ * Production deployment orchestration agent.
  */
 export class DevOpsAgent {
+  private readonly confidenceEngine: Pick<ConfidenceEngine, 'compute'>
+  private readonly approvalGateway: Pick<ApprovalGateway, 'createApproval'>
+  private readonly fetchImpl: typeof fetch
+  private readonly now: () => Date
+  private readonly sleepFn: (ms: number) => Promise<void>
 
-  // -------------------------------------------------------------------------
-  // Task router
-  // -------------------------------------------------------------------------
+  constructor(deps: DevOpsAgentDependencies = {}) {
+    this.confidenceEngine = deps.confidenceEngine ?? new ConfidenceEngine()
+    this.approvalGateway = deps.approvalGateway ?? new ApprovalGateway()
+    this.fetchImpl = deps.fetchImpl ?? fetch
+    this.now = deps.now ?? (() => new Date())
+    this.sleepFn = deps.sleepFn ?? sleep
+  }
 
   /**
-   * Routes an incoming AgentTask to deploy, rollback, or cost analysis.
-   *
-   * Payload fields:
-   *   action?: 'deploy' | 'rollback' | 'cost_analysis'
-   *   environment?: string
-   *   commitSha?: string
+   * Main task router for deploy/rollback/cost-analysis/health-check actions.
    */
   async handleTask(task: AgentTask): Promise<DevOpsResult> {
-    const taskLog = createContextLogger('devops-agent', {
+    const taskLog = createContextLogger('agent-devops', {
       taskId: task.id,
       projectId: task.projectId,
+      taskType: task.type,
     })
-    taskLog.info({ taskType: task.type }, 'DevOps agent received task')
 
-    const payload = task.payload as Record<string, unknown>
-    const action = payload['action'] as string | undefined
+    const payload = asRecord(task.payload)
+    const action = this.resolveAction(task, payload)
+
+    taskLog.info({ action }, 'DevOps task received')
 
     try {
-      if (task.type === 'rollback' || action === 'rollback') {
-        const result = await this.triggerRollback(task)
-        return { taskId: task.id, projectId: task.projectId, action: 'rollback', success: true, deployResult: result, completedAt: new Date() }
+      if (action === 'rollback') {
+        const deployResult = await this.triggerRollback(task)
+        return {
+          taskId: task.id,
+          projectId: task.projectId,
+          action,
+          success: true,
+          deployResult,
+          completedAt: this.now(),
+        }
       }
 
-      if (task.type === 'cost_analysis' || action === 'cost_analysis') {
-        const result = await this.analyzeCosts(task.projectId)
-        return { taskId: task.id, projectId: task.projectId, action: 'cost_analysis', success: true, costRecord: result, completedAt: new Date() }
+      if (action === 'cost_analysis') {
+        const costPayload = this.parseCostAnalysisPayload(payload)
+        const costRecord = await this.analyzeCosts(task.projectId, costPayload.lookbackDays)
+        const platformCosts = await this.calculatePlatformCosts(task.projectId, costPayload.lookbackDays)
+        return {
+          taskId: task.id,
+          projectId: task.projectId,
+          action,
+          success: true,
+          costRecord,
+          platformCosts,
+          completedAt: this.now(),
+        }
       }
 
-      // Default: deploy
-      const result = await this.triggerDeploy(task)
-      return { taskId: task.id, projectId: task.projectId, action: 'deploy', success: true, deployResult: result, completedAt: new Date() }
+      if (action === 'health_check') {
+        const deploymentId = readString(payload['deploymentId'])
+        if (!deploymentId) {
+          throw new Error('health_check requires payload.deploymentId')
+        }
+        const rolledBack = await this.checkAutoRollbackTriggers(deploymentId, task.projectId)
+        const deployment = await prisma.deployment.findUnique({ where: { id: deploymentId } })
+        const environment = deployment ? fromDbEnvironment(deployment.environment) : 'production'
+        const provider = deployment ? parseProvider(deployment.provider) : undefined
+        if (!provider) {
+          throw new Error(`Unknown deployment provider for deployment ${deploymentId}`)
+        }
+
+        const deployResult: DeployResult = {
+          deploymentId,
+          projectId: task.projectId,
+          environment,
+          provider,
+          status: rolledBack ? 'rolled_back' : 'succeeded',
+          startedAt: deployment?.startedAt ?? this.now(),
+          completedAt: this.now(),
+          summary: rolledBack
+            ? 'Auto-rollback triggered during health check'
+            : 'Health check passed; no rollback required',
+          stageResults: [],
+        }
+
+        return {
+          taskId: task.id,
+          projectId: task.projectId,
+          action,
+          success: true,
+          deployResult,
+          completedAt: this.now(),
+        }
+      }
+
+      const deployResult = await this.triggerDeploy(task)
+      return {
+        taskId: task.id,
+        projectId: task.projectId,
+        action: 'deploy',
+        success: true,
+        deployResult,
+        completedAt: this.now(),
+      }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       taskLog.error({ err }, 'DevOps task failed')
-      return { taskId: task.id, projectId: task.projectId, action: 'deploy', success: false, error: message, completedAt: new Date() }
+
+      const failedResult: DevOpsResult = {
+        taskId: task.id,
+        projectId: task.projectId,
+        action,
+        success: false,
+        error: message,
+        completedAt: this.now(),
+      }
+
+      if (err instanceof ApprovalRequiredError) {
+        failedResult.approvalRequested = true
+      }
+
+      return failedResult
     }
   }
 
-  // -------------------------------------------------------------------------
-  // Deploy
-  // -------------------------------------------------------------------------
-
   /**
-   * Triggers a deployment on the configured provider, records it in the DB,
-   * and schedules post-deploy health monitoring.
-   *
-   * Payload fields used:
-   *   environment: 'preview' | 'staging' | 'production'
-   *   commitSha?: string
-   *   commitMessage?: string
-   *
-   * @param task - The deploy AgentTask.
+   * Deploys through a staged rollout:
+   * preview -> staging -> production.
    */
   async triggerDeploy(task: AgentTask): Promise<DeployResult> {
-    const deployLog = createContextLogger('devops-agent', { projectId: task.projectId, taskId: task.id })
-    deployLog.info('Triggering deployment')
+    const payload = this.parseDeployTaskPayload(asRecord(task.payload))
+    const deployLog = createContextLogger('agent-devops', {
+      taskId: task.id,
+      projectId: task.projectId,
+      targetEnvironment: payload.environment,
+    })
 
-    const payload = task.payload as Record<string, unknown>
-    const environment = (payload['environment'] as string | undefined) ?? 'staging'
-    const commitSha = payload['commitSha'] as string | undefined
-    const commitMessage = payload['commitMessage'] as string | undefined
+    const pipeline = await this.resolveDeploymentPipeline(task.projectId, payload)
+    const stagePlan = this.buildStagePlan(payload.environment)
 
-    // Fetch the project pipeline config to know which provider to call
-    const pipeline = await this.fetchDeploymentPipeline(task.projectId)
+    if (payload.environment === 'production' && !stagePlan.includes('staging')) {
+      throw new Error('Production deployments must pass through staging')
+    }
 
-    // Check promotion rules before deploying to production
-    if (environment === 'production') {
-      const promotionCheck = await this.checkPromotionRules(task.projectId, pipeline)
-      if (!promotionCheck.allowed) {
-        throw new Error(`Promotion to production blocked: ${promotionCheck.reason}`)
+    if (payload.environment === 'production') {
+      this.assertAllowedDeploymentWindow(
+        this.now(),
+        pipeline.blockedTimeWindows,
+        payload.overrideFrozenWindow,
+      )
+    }
+
+    let confidenceScore = await this.calculateDeploymentConfidence(task, payload)
+    if (confidenceScore.recommendation === 'block') {
+      throw new Error(
+        `Deployment blocked by confidence engine (${confidenceScore.total}/100): ${confidenceScore.humanReadableSummary}`,
+      )
+    }
+
+    const rolloutStartedAt = this.now()
+    const stageResults: StageDeployResult[] = []
+
+    for (const stage of stagePlan) {
+      if (stage === 'production') {
+        await this.assertProductionPromotionGate(
+          task.projectId,
+          stageResults,
+          confidenceScore,
+          pipeline.promotionGates,
+        )
+
+        await this.ensureProductionApproval(task, payload, confidenceScore, stageResults)
       }
-    }
 
-    const env = pipeline.environments.find((e) => e.name === environment)
-    if (!env) {
-      throw new Error(`Environment  + dl + {environment} not configured for project ${task.projectId}`)
-    }
+      const environment = pipeline.environments[stage]
+      const stageResult = await this.deployEnvironment(task, environment, payload, confidenceScore)
+      stageResults.push(stageResult)
 
-    // Persist deployment record before triggering so partial failures are tracked
-    const deploymentId = `deploy-${task.projectId}-${Date.now()}`
-    await this.persistDeploymentRecord({
-      id: deploymentId,
-      projectId: task.projectId,
-      environment: env.name,
-      status: 'in_progress',
-      provider: env.provider,
-      commitSha,
-      commitMessage,
-      url: env.url,
-      startedAt: new Date(),
-    })
+      const health = await this.runConsecutiveHealthChecks(
+        stageResult.url,
+        pipeline.rollbackConfig.healthCheckFailureThreshold,
+        pipeline.rollbackConfig.healthCheckIntervalMs,
+      )
 
-    deployLog.info({ deploymentId, provider: env.provider, environment }, 'Deployment record created; calling provider API')
+      if (!health.healthy) {
+        deployLog.error(
+          { stage, statusCode: health.statusCode, failures: health.failures },
+          'Post-deploy health checks failed',
+        )
 
-    // Call the provider-specific deploy API
-    let deployUrl: string | undefined
-    try {
-      deployUrl = await this.callProviderDeploy(env, commitSha)
-    } catch (err) {
-      await this.updateDeploymentStatus(deploymentId, 'failed')
-      throw err
-    }
+        if (stage === 'production') {
+          const reason = `Health checks failed ${health.failures} consecutive times`
+          await this.executeAutoRollbackForStage(task, stageResult, reason)
+          stageResult.status = 'rolled_back'
+          stageResult.rollbackReason = reason
+        }
 
-    await this.updateDeploymentStatus(deploymentId, 'succeeded', deployUrl)
+        throw new Error(
+          `Deployment to ${stage} failed health checks (status ${health.statusCode})`,
+        )
+      }
 
-    deployLog.info({ deploymentId, deployUrl }, 'Deployment succeeded; scheduling health monitor')
+      if (stage === 'production') {
+        void this.monitorPostDeployment(task, stageResult, pipeline.rollbackConfig)
 
-    // Schedule non-blocking post-deploy health check
-    void this.monitorPostDeploy(deploymentId, task.projectId, deployUrl, pipeline.rollbackConfig)
-
-    return {
-      deploymentId,
-      projectId: task.projectId,
-      environment,
-      provider: env.provider,
-      status: 'succeeded',
-      url: deployUrl,
-      commitSha,
-      startedAt: new Date(),
-      completedAt: new Date(),
-      summary: `Deployed commit ${commitSha ?? 'HEAD'} to ${environment} on ${env.provider}`,
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // Rollback
-  // -------------------------------------------------------------------------
-
-  /**
-   * Rolls back to the previous successful deployment.
-   *
-   * Steps:
-   * 1. Finds the last good deployment in the DB.
-   * 2. Calls the provider rollback API.
-   * 3. Creates an incident record documenting the rollback.
-   * 4. Notifies project admins with cause and timeline.
-   *
-   * @param task - The rollback AgentTask.
-   */
-  async triggerRollback(task: AgentTask): Promise<DeployResult> {
-    const rbLog = createContextLogger('devops-agent', { projectId: task.projectId, taskId: task.id })
-    rbLog.warn('Initiating rollback')
-
-    const payload = task.payload as Record<string, unknown>
-    const environment = (payload['environment'] as string | undefined) ?? 'production'
-    const reason = (payload['reason'] as string | undefined) ?? 'Manual rollback requested'
-
-    // Find the last good deployment to roll back to
-    const previousDeploy = await this.fetchLastSuccessfulDeployment(task.projectId, environment)
-
-    if (!previousDeploy) {
-      throw new Error(`No previous successful deployment found for ${environment}`)
-    }
-
-    const pipeline = await this.fetchDeploymentPipeline(task.projectId)
-    const env = pipeline.environments.find((e) => e.name === environment)
-    if (!env) {
-      throw new Error(`Environment  + dl + {environment} not configured`)
-    }
-
-    const rollbackId = `rollback-${task.projectId}-${Date.now()}`
-    await this.persistDeploymentRecord({
-      id: rollbackId,
-      projectId: task.projectId,
-      environment: env.name,
-      status: 'in_progress',
-      provider: env.provider,
-      commitSha: previousDeploy.commitSha,
-      commitMessage: `ROLLBACK to ${previousDeploy.commitSha ?? 'previous'}: ${reason}`,
-      url: env.url,
-      startedAt: new Date(),
-    })
-
-    rbLog.warn({ rollbackId, targetCommit: previousDeploy.commitSha, reason }, 'Rolling back deployment')
-
-    try {
-      await this.callProviderRollback(env, previousDeploy)
-    } catch (err) {
-      await this.updateDeploymentStatus(rollbackId, 'failed')
-      throw err
-    }
-
-    await this.updateDeploymentStatus(rollbackId, 'rolled_back')
-
-    // Create incident record for audit trail
-    await this.persistRollbackIncident(task.projectId, rollbackId, reason, previousDeploy)
-
-    // Notify admins with cause and timeline
-    await this.notifyRollback(task.projectId, environment, reason, previousDeploy)
-
-    rbLog.warn({ rollbackId }, 'Rollback complete')
-
-    return {
-      deploymentId: rollbackId,
-      projectId: task.projectId,
-      environment,
-      provider: env.provider,
-      status: 'rolled_back',
-      commitSha: previousDeploy.commitSha,
-      startedAt: new Date(),
-      completedAt: new Date(),
-      summary: `Rolled back ${environment} to commit ${previousDeploy.commitSha ?? 'previous'}. Reason: ${reason}`,
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // Cost Analysis
-  // -------------------------------------------------------------------------
-
-  /**
-   * Fetches cost data from all configured providers, detects anomalies
-   * (>20% week-over-week spike), and generates a human-readable summary.
-   *
-   * Alert example:
-   *   "Your AI API costs increased 40% this week — likely from the new
-   *   search feature. At current growth, projected monthly cost is ."
-   *
-   * @param projectId - UUID of the project.
-   */
-  async analyzeCosts(projectId: string): Promise<CostRecord> {
-    const costLog = createContextLogger('devops-agent', { projectId })
-    costLog.info('Analysing infrastructure costs')
-
-    // Fetch the project provider config
-    const pipeline = await this.fetchDeploymentPipeline(projectId)
-
-    // Fetch cost breakdowns from each configured provider
-    const breakdowns = await Promise.all(
-      pipeline.environments.map((env) => this.fetchProviderCosts(projectId, env)),
-    )
-
-    // Aggregate across providers
-    const breakdown = {
-      hosting:             breakdowns.reduce((s, b) => s + b.hosting, 0),
-      aiApiCalls:          breakdowns.reduce((s, b) => s + b.aiApiCalls, 0),
-      database:            breakdowns.reduce((s, b) => s + b.database, 0),
-      storage:             breakdowns.reduce((s, b) => s + b.storage, 0),
-      monitoring:          breakdowns.reduce((s, b) => s + b.monitoring, 0),
-      thirdPartyServices:  breakdowns.reduce((s, b) => s + b.thirdPartyServices, 0),
-    }
-    const total = Object.values(breakdown).reduce((s, v) => s + v, 0)
-
-    // Fetch previous week costs for anomaly detection
-    const previousCost = await this.fetchPreviousWeekCost(projectId)
-    const anomalies: CostAnomaly[] = []
-
-    if (previousCost !== null) {
-      // Detect >20% week-over-week spike in each category
-      const categories = Object.keys(breakdown) as Array<keyof typeof breakdown>
-      for (const category of categories) {
-        const current = breakdown[category]
-        const previous = previousCost.breakdown[category] ?? 0
-        if (previous > 0) {
-          const changePercent = ((current - previous) / previous) * 100
-          if (changePercent > 20) {
-            const explanation = this.generateCostSpikeExplanation(category, changePercent, current, previous)
-            anomalies.push({ category, previousAmount: previous, currentAmount: current, changePercent, explanation })
-            costLog.warn({ category, changePercent: changePercent.toFixed(1) }, 'Cost spike detected')
-          }
+        if (payload.dns && payload.dns.records.length > 0) {
+          await this.updateDnsRecords(task.projectId, environment, stageResult, payload.dns)
+          stageResult.dnsUpdated = true
+        }
+      } else {
+        confidenceScore = await this.calculateDeploymentConfidence(task, payload)
+        if (confidenceScore.recommendation === 'block') {
+          throw new Error(
+            `Deployment confidence dropped below safe threshold after ${stage}`,
+          )
         }
       }
     }
 
-    // Project monthly cost based on current week spend (x 4.33 weeks/month)
-    const projectedMonthly = total * 4.33
+    const finalStage = stageResults[stageResults.length - 1]
+    if (!finalStage) {
+      throw new Error('Staged rollout produced no deployment results')
+    }
+
+    const totalCostUsd = roundCurrency(
+      stageResults.reduce((sum, stage) => sum + stage.estimatedCostUsd, 0),
+    )
+
+    const deployResult: DeployResult = {
+      deploymentId: finalStage.deploymentId,
+      projectId: task.projectId,
+      environment: finalStage.environment,
+      provider: finalStage.provider,
+      status: finalStage.status,
+      startedAt: rolloutStartedAt,
+      completedAt: this.now(),
+      summary: `Staged rollout completed: ${stagePlan.join(' -> ')}`,
+      stageResults,
+      confidenceScore,
+      totalCostUsd,
+    }
+
+    if (finalStage.url) {
+      deployResult.url = finalStage.url
+    }
+
+    if (payload.commitSha) {
+      deployResult.commitSha = payload.commitSha
+    }
+
+    if (stageResults.some((s) => s.dnsUpdated)) {
+      deployResult.dnsUpdated = true
+    }
+
+    return deployResult
+  }
+
+  /**
+   * Rolls back to a previous successful deployment.
+   */
+  async triggerRollback(task: AgentTask): Promise<DeployResult> {
+    const payload = this.parseRollbackTaskPayload(asRecord(task.payload))
+    const rollbackLog = createContextLogger('agent-devops', {
+      taskId: task.id,
+      projectId: task.projectId,
+      environment: payload.environment,
+    })
+
+    const pipeline = await this.resolveDeploymentPipeline(task.projectId, {
+      environment: payload.environment,
+      provider: payload.provider,
+      overrideFrozenWindow: true,
+      forceApproval: false,
+    })
+
+    const environment = pipeline.environments[payload.environment]
+    const rollbackTarget = await this.fetchRollbackTarget(
+      task.projectId,
+      payload.environment,
+      payload.rollbackToDeploymentId,
+      payload.excludeDeploymentId,
+    )
+
+    if (!rollbackTarget) {
+      throw new Error(`No successful ${payload.environment} deployment available for rollback`)
+    }
+
+    const startedAt = this.now()
+
+    const rollbackRecord = await prisma.deployment.create({
+      data: {
+        projectId: task.projectId,
+        environment: toDbEnvironment(payload.environment) as never,
+        status: 'IN_PROGRESS' as never,
+        provider: environment.provider,
+        commitSha: rollbackTarget.commitSha ?? undefined,
+        commitMessage: `ROLLBACK: ${payload.reason}`,
+        branch: rollbackTarget.branch ?? undefined,
+        triggeredBy: task.requestedBy,
+      },
+    })
+
+    try {
+      await this.callProviderRollback(environment, rollbackTarget)
+
+      const completedAt = this.now()
+      const durationMs = Math.max(0, completedAt.getTime() - startedAt.getTime())
+      const rollbackUrl = rollbackTarget.url ?? environment.url
+
+      await prisma.deployment.update({
+        where: { id: rollbackRecord.id },
+        data: {
+          status: 'ROLLED_BACK' as never,
+          url: rollbackUrl,
+          completedAt,
+          durationMs,
+          rollbackReason: payload.reason,
+          autoRolledBack: payload.automatic,
+        },
+      })
+
+      await prisma.incident.create({
+        data: {
+          projectId: task.projectId,
+          title: `Rollback executed in ${payload.environment}`,
+          description: payload.reason,
+          severity: 'HIGH' as never,
+          status: 'RESOLVED' as never,
+          affectedModules: ['deployment'],
+          deploymentId: rollbackRecord.id,
+          detectedAt: startedAt,
+          resolvedAt: completedAt,
+        },
+      })
+
+      const deployResult: DeployResult = {
+        deploymentId: rollbackRecord.id,
+        projectId: task.projectId,
+        environment: payload.environment,
+        provider: environment.provider,
+        status: 'rolled_back',
+        startedAt,
+        completedAt,
+        summary: `Rolled back ${payload.environment} to deployment ${rollbackTarget.id}`,
+        stageResults: [],
+      }
+
+      if (rollbackUrl) {
+        deployResult.url = rollbackUrl
+      }
+
+      if (rollbackTarget.commitSha) {
+        deployResult.commitSha = rollbackTarget.commitSha
+      }
+
+      return deployResult
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      rollbackLog.error({ err }, 'Rollback failed')
+
+      await prisma.deployment.update({
+        where: { id: rollbackRecord.id },
+        data: {
+          status: 'FAILED' as never,
+          rollbackReason: message,
+          completedAt: this.now(),
+          durationMs: Math.max(0, this.now().getTime() - startedAt.getTime()),
+        },
+      })
+
+      throw err
+    }
+  }
+
+  /**
+   * Analyzes deployment costs for a lookback window.
+   */
+  async analyzeCosts(projectId: string, lookbackDays = 7): Promise<CostRecord> {
+    const boundedLookbackDays = Math.max(1, Math.floor(lookbackDays))
+    const periodEnd = this.now()
+    const periodStart = new Date(periodEnd.getTime() - boundedLookbackDays * DAY_MS)
+    const previousStart = new Date(periodStart.getTime() - boundedLookbackDays * DAY_MS)
+
+    const [currentDeployments, previousDeployments] = await Promise.all([
+      prisma.deployment.findMany({
+        where: {
+          projectId,
+          completedAt: { gte: periodStart },
+          status: { in: ['SUCCEEDED', 'ROLLED_BACK'] as never[] },
+        },
+      }),
+      prisma.deployment.findMany({
+        where: {
+          projectId,
+          completedAt: { gte: previousStart, lt: periodStart },
+          status: { in: ['SUCCEEDED', 'ROLLED_BACK'] as never[] },
+        },
+      }),
+    ])
+
+    const currentCosts = this.aggregateProviderCosts(currentDeployments)
+    const previousCosts = this.aggregateProviderCosts(previousDeployments)
+
+    const anomalies: CostAnomaly[] = []
+    for (const provider of DEPLOY_PROVIDERS) {
+      const previous = previousCosts[provider]
+      const current = currentCosts[provider]
+      if (previous <= 0) {
+        continue
+      }
+      const changePercent = ((current - previous) / previous) * 100
+      if (changePercent > 20) {
+        anomalies.push(
+          this.buildCostAnomaly(provider, current, previous, changePercent, boundedLookbackDays),
+        )
+      }
+    }
+
+    const total = roundCurrency(
+      currentCosts.vercel + currentCosts.railway + currentCosts.fly,
+    )
 
     const costRecord: CostRecord = {
       projectId,
-      period: new Date(),
-      breakdown,
+      period: periodEnd,
+      breakdown: {
+        hosting: total,
+        aiApiCalls: 0,
+        database: 0,
+        storage: 0,
+        monitoring: 0,
+        thirdPartyServices: 0,
+      },
       total,
-      projectedMonthly,
+      projectedMonthly: roundCurrency(total * 4.33),
       anomalies,
     }
 
-    await this.persistCostRecord(costRecord)
-
-    costLog.info({ total, projectedMonthly, anomalyCount: anomalies.length }, 'Cost analysis complete')
+    const organizationId = await this.fetchOrganizationId(projectId)
+    await prisma.auditLog.create({
+      data: {
+        projectId,
+        organizationId,
+        actor: 'agent:devops:cost-analysis',
+        actorType: 'agent',
+        action: 'deployment.cost_analysis',
+        resourceType: 'deployment',
+        outcome: 'success',
+        metadata: {
+          lookbackDays: boundedLookbackDays,
+          platformCosts: currentCosts,
+          anomalies,
+        },
+      },
+    })
 
     return costRecord
   }
 
-  // Auto-Rollback Triggers
-
   /**
-   * Checks if a deployment should be auto-rolled back based on hard metrics.
-   * Triggers: error rate >150%, p99 >300%, health check fails 3x.
-   *
-   * @returns true when rollback was triggered, false otherwise.
+   * Evaluates rollback triggers for an already-created deployment.
    */
-  async checkAutoRollbackTriggers(deploymentId: string, projectId: string): Promise<boolean> {
-    const rbLog = createContextLogger('devops-agent', { projectId, deploymentId })
+  async checkAutoRollbackTriggers(
+    deploymentId: string,
+    projectId: string,
+    configOverride?: RollbackConfig,
+  ): Promise<boolean> {
+    const deployment = await prisma.deployment.findUnique({ where: { id: deploymentId } })
+    if (!deployment) {
+      throw new Error(`Deployment not found: ${deploymentId}`)
+    }
 
-    const config     = await this.fetchRollbackConfig(projectId)
-    const baseline   = await this.fetchPreDeployMetrics(projectId)
-    const current    = await this.fetchCurrentMetrics(projectId)
-    const hcResult   = await this.runConsecutiveHealthChecks(projectId, config.healthCheckFailureThreshold)
+    const provider = parseProvider(deployment.provider)
+    if (!provider) {
+      throw new Error(`Unsupported deployment provider '${deployment.provider}'`) 
+    }
+
+    const config = configOverride ?? DEFAULT_ROLLBACK_CONFIG
+    const baseline = await this.fetchPreDeployMetrics(projectId, deployment.startedAt)
+    const current = await this.fetchCurrentMetrics(projectId)
+
+    const health = await this.runConsecutiveHealthChecks(
+      deployment.url ?? undefined,
+      config.healthCheckFailureThreshold,
+      config.healthCheckIntervalMs,
+    )
 
     const errorRateTrigger = baseline.errorRate > 0
-      ? current.errorRate / baseline.errorRate > config.errorRateMultiplierThreshold
-      : current.errorRate > 0.05
+      ? current.errorRate / baseline.errorRate >= config.errorRateMultiplierThreshold
+      : current.errorRate >= 0.05
 
     const latencyTrigger = baseline.p99LatencyMs > 0
-      ? current.p99LatencyMs / baseline.p99LatencyMs > config.p99LatencyMultiplierThreshold
+      ? current.p99LatencyMs / baseline.p99LatencyMs >= config.p99LatencyMultiplierThreshold
       : false
 
-    const healthCheckTrigger = !hcResult.healthy
+    const healthCheckTrigger = !health.healthy
 
     if (!errorRateTrigger && !latencyTrigger && !healthCheckTrigger) {
-      rbLog.debug('Auto-rollback check passed; all metrics within bounds')
       return false
     }
 
-    const causes: string[] = []
+    const reasons: string[] = []
     if (errorRateTrigger) {
-      const from = (baseline.errorRate * 100).toFixed(2)
-      const to   = (current.errorRate  * 100).toFixed(2)
-      causes.push(`Error rate ${from}% -> ${to}%`)
+      reasons.push(
+        `Error rate increased from ${(baseline.errorRate * 100).toFixed(2)}% to ${(current.errorRate * 100).toFixed(2)}%`,
+      )
     }
     if (latencyTrigger) {
-      causes.push(`p99 latency ${baseline.p99LatencyMs}ms -> ${current.p99LatencyMs}ms`)
+      reasons.push(
+        `p99 latency increased from ${baseline.p99LatencyMs.toFixed(0)}ms to ${current.p99LatencyMs.toFixed(0)}ms`,
+      )
     }
     if (healthCheckTrigger) {
-      causes.push(`Health check failed ${config.healthCheckFailureThreshold} consecutive times`)
+      reasons.push(
+        `Health checks failed (${health.failures} failures, last status ${health.statusCode})`,
+      )
     }
 
-    const causeText = causes.join('; ')
-    rbLog.error({ deploymentId, causes }, 'Auto-rollback triggered')
+    const reason = reasons.join('; ')
 
-    const rollbackTask: AgentTask = {
-      id: `auto-rollback-${deploymentId}`,
+    const stageResult: StageDeployResult = {
+      deploymentId: deployment.id,
+      projectId,
+      environment: fromDbEnvironment(deployment.environment),
+      provider,
+      status: 'succeeded',
+      startedAt: deployment.startedAt,
+      completedAt: deployment.completedAt ?? this.now(),
+      durationMs: deployment.durationMs ?? 0,
+      estimatedCostUsd: 0,
+      summary: 'Deployed release under monitoring',
+    }
+
+    if (deployment.url) {
+      stageResult.url = deployment.url
+    }
+
+    if (deployment.commitSha) {
+      stageResult.commitSha = deployment.commitSha
+    }
+
+    const organizationId = await this.fetchOrganizationId(projectId)
+    const autoRollbackTask: AgentTask = {
+      id: randomUUID(),
       type: 'rollback',
       priority: 'critical',
       projectId,
-      organizationId: await this.fetchOrganizationId(projectId),
-      payload: { action: 'rollback', environment: 'production', reason: causeText },
+      organizationId,
+      payload: {
+        action: 'rollback',
+        environment: stageResult.environment,
+        reason,
+        provider,
+        excludeDeploymentId: deployment.id,
+        automatic: true,
+      },
       requestedBy: 'system',
       autonomyLevel: 'autonomous',
-      createdAt: new Date(),
+      createdAt: this.now(),
+    }
+
+    await this.executeAutoRollbackForStage(autoRollbackTask, stageResult, reason)
+    return true
+  }
+
+  private resolveAction(
+    task: AgentTask,
+    payload: Record<string, unknown>,
+  ): DevOpsResult['action'] {
+    const payloadAction = readString(payload['action'])
+    if (payloadAction === 'rollback') return 'rollback'
+    if (payloadAction === 'cost_analysis') return 'cost_analysis'
+    if (payloadAction === 'health_check') return 'health_check'
+
+    if (task.type === 'rollback') return 'rollback'
+    if (task.type === 'cost_analysis') return 'cost_analysis'
+    return 'deploy'
+  }
+
+  private parseDeployTaskPayload(payload: Record<string, unknown>): DeployTaskPayload {
+    const parsed: DeployTaskPayload = {
+      environment: parseEnvironment(payload['environment']) ?? 'production',
+      overrideFrozenWindow: readBoolean(payload['overrideFrozenWindow']) ?? false,
+      forceApproval: readBoolean(payload['forceApproval']) ?? false,
+    }
+
+    const provider = parseProvider(payload['provider'])
+    if (provider) parsed.provider = provider
+
+    const commitSha = readString(payload['commitSha'])
+    if (commitSha) parsed.commitSha = commitSha
+
+    const commitMessage = readString(payload['commitMessage'])
+    if (commitMessage) parsed.commitMessage = commitMessage
+
+    const branch = readString(payload['branch'])
+    if (branch) parsed.branch = branch
+
+    const changedFiles = readStringArray(payload['changedFiles'])
+    if (changedFiles.length > 0) parsed.changedFiles = changedFiles
+
+    const ciPassing = readBoolean(payload['ciPassing'])
+    if (ciPassing !== undefined) parsed.ciPassing = ciPassing
+
+    const ciCoverage = readNumber(payload['ciCoverage'])
+    if (ciCoverage !== undefined) parsed.ciCoverage = ciCoverage
+
+    const securityScanPassed = readBoolean(payload['securityScanPassed'])
+    if (securityScanPassed !== undefined) parsed.securityScanPassed = securityScanPassed
+
+    const blockedTimeWindows = parseTimeWindows(payload['blockedTimeWindows'])
+    if (blockedTimeWindows.length > 0) parsed.blockedTimeWindows = blockedTimeWindows
+
+    const minStagingMinutes = readNumber(payload['minStagingMinutes'])
+    if (minStagingMinutes !== undefined) parsed.minStagingMinutes = Math.max(0, minStagingMinutes)
+
+    const maxErrorRateDelta = readNumber(payload['maxErrorRateDelta'])
+    if (maxErrorRateDelta !== undefined) {
+      parsed.maxErrorRateDelta = Math.max(0, maxErrorRateDelta)
+    }
+
+    const confidenceMinScore = readNumber(payload['confidenceMinScore'])
+    if (confidenceMinScore !== undefined) {
+      parsed.confidenceMinScore = Math.min(100, Math.max(0, confidenceMinScore))
+    }
+
+    const rollbackConfig = parseRollbackConfig(payload['rollbackConfig'])
+    if (rollbackConfig) parsed.rollbackConfig = rollbackConfig
+
+    const providers = parseProviderConfigMap(payload['providers'])
+    if (providers) parsed.providers = providers
+
+    const environments = parseEnvironmentConfigMap(payload['environments'])
+    if (environments) parsed.environments = environments
+
+    const dns = parseDnsUpdateConfig(payload['dns'])
+    if (dns) parsed.dns = dns
+
+    return parsed
+  }
+
+  private parseRollbackTaskPayload(payload: Record<string, unknown>): RollbackTaskPayload {
+    const parsed: RollbackTaskPayload = {
+      environment: parseEnvironment(payload['environment']) ?? 'production',
+      reason: readString(payload['reason']) ?? 'Rollback requested',
+      automatic: readBoolean(payload['automatic']) ?? false,
+    }
+
+    const provider = parseProvider(payload['provider'])
+    if (provider) parsed.provider = provider
+
+    const rollbackToDeploymentId = readString(payload['rollbackToDeploymentId'])
+    if (rollbackToDeploymentId) parsed.rollbackToDeploymentId = rollbackToDeploymentId
+
+    const excludeDeploymentId = readString(payload['excludeDeploymentId'])
+    if (excludeDeploymentId) parsed.excludeDeploymentId = excludeDeploymentId
+
+    const providers = parseProviderConfigMap(payload['providers'])
+    if (providers) parsed.providers = providers
+
+    const environments = parseEnvironmentConfigMap(payload['environments'])
+    if (environments) parsed.environments = environments
+
+    return parsed
+  }
+
+  private parseCostAnalysisPayload(payload: Record<string, unknown>): CostAnalysisPayload {
+    const requestedDays = readNumber(payload['lookbackDays'])
+    return {
+      lookbackDays:
+        requestedDays !== undefined && requestedDays > 0
+          ? Math.floor(requestedDays)
+          : 7,
+    }
+  }
+
+  private async resolveDeploymentPipeline(
+    projectId: string,
+    payload: Pick<
+      DeployTaskPayload,
+      | 'provider'
+      | 'providers'
+      | 'environments'
+      | 'blockedTimeWindows'
+      | 'rollbackConfig'
+      | 'minStagingMinutes'
+      | 'maxErrorRateDelta'
+      | 'confidenceMinScore'
+    >,
+  ): Promise<DeploymentPipeline> {
+    const project = await prisma.project.findUnique({
+      where: { id: projectId },
+      include: { integrations: true },
+    })
+
+    if (!project) {
+      throw new Error(`Project not found: ${projectId}`)
+    }
+
+    const provider =
+      payload.provider ??
+      parseProvider(project.hostingProvider) ??
+      this.providerFromIntegrations(project.integrations)
+
+    if (!provider) {
+      throw new Error(
+        'No deploy provider configured. Set payload.provider or project hosting integration.',
+      )
+    }
+
+    const integrationConfig = this.integrationConfigForProvider(
+      project.integrations,
+      provider,
+    )
+    const providerOverride = payload.providers?.[provider]
+
+    const environments: Record<DeployEnvironmentName, EnvironmentConfig> = {
+      preview: this.buildEnvironmentConfig(
+        'preview',
+        provider,
+        project,
+        integrationConfig,
+        providerOverride,
+        payload.environments?.preview,
+      ),
+      staging: this.buildEnvironmentConfig(
+        'staging',
+        provider,
+        project,
+        integrationConfig,
+        providerOverride,
+        payload.environments?.staging,
+      ),
+      production: this.buildEnvironmentConfig(
+        'production',
+        provider,
+        project,
+        integrationConfig,
+        providerOverride,
+        payload.environments?.production,
+      ),
+    }
+
+    const blockedTimeWindows = normalizeTimeWindows([
+      ...DEFAULT_BLOCKED_TIME_WINDOWS,
+      ...(payload.blockedTimeWindows ?? []),
+    ])
+
+    const rollbackConfig: RollbackConfig = {
+      ...DEFAULT_ROLLBACK_CONFIG,
+      ...(payload.rollbackConfig ?? {}),
+    }
+
+    const promotionGates: PromotionGates = {
+      minStagingMinutes:
+        payload.minStagingMinutes ?? DEFAULT_PROMOTION_GATES.minStagingMinutes,
+      maxErrorRateDelta:
+        payload.maxErrorRateDelta ?? DEFAULT_PROMOTION_GATES.maxErrorRateDelta,
+      minConfidenceScore:
+        payload.confidenceMinScore ?? DEFAULT_PROMOTION_GATES.minConfidenceScore,
+    }
+
+    return {
+      projectId,
+      provider,
+      environments,
+      blockedTimeWindows,
+      rollbackConfig,
+      promotionGates,
+    }
+  }
+
+  private providerFromIntegrations(
+    integrations: Array<{ type: string; config: unknown }>,
+  ): DeployProvider | undefined {
+    const availableTypes = new Set(integrations.map((integration) => integration.type))
+    if (availableTypes.has('VERCEL')) return 'vercel'
+    if (availableTypes.has('RAILWAY')) return 'railway'
+    if (availableTypes.has('FLY')) return 'fly'
+    return undefined
+  }
+
+  private integrationConfigForProvider(
+    integrations: Array<{ type: string; config: unknown }>,
+    provider: DeployProvider,
+  ): Record<string, unknown> {
+    const integrationType = this.integrationTypeForProvider(provider)
+    const integration = integrations.find((item) => item.type === integrationType)
+    return asRecord(integration?.config)
+  }
+
+  private integrationTypeForProvider(provider: DeployProvider): 'VERCEL' | 'RAILWAY' | 'FLY' {
+    if (provider === 'vercel') return 'VERCEL'
+    if (provider === 'railway') return 'RAILWAY'
+    return 'FLY'
+  }
+
+  private buildEnvironmentConfig(
+    stage: DeployEnvironmentName,
+    provider: DeployProvider,
+    project: {
+      hostingProjectId: string | null
+      stagingUrl: string | null
+      productionUrl: string | null
+    },
+    integrationConfig: Record<string, unknown>,
+    providerOverride: ProviderConfigOverride | undefined,
+    environmentOverride: EnvironmentConfigOverride | undefined,
+  ): EnvironmentConfig {
+    const stageProjectKey = `${stage}ProjectId`
+    const stageEnvKey = `${stage}EnvironmentId`
+
+    const token =
+      environmentOverride?.token ??
+      providerOverride?.token ??
+      readString(integrationConfig['token']) ??
+      this.providerTokenFromEnv(provider)
+
+    if (!token) {
+      throw new Error(`Missing ${provider} API token for ${stage} environment`)
+    }
+
+    const providerProjectId =
+      environmentOverride?.providerProjectId ??
+      environmentOverride?.projectId ??
+      providerOverride?.[stageProjectKey as keyof ProviderConfigOverride] ??
+      providerOverride?.projectId ??
+      readString(integrationConfig[stageProjectKey]) ??
+      readString(integrationConfig['projectId']) ??
+      project.hostingProjectId ??
+      undefined
+
+    const appName =
+      environmentOverride?.appName ??
+      providerOverride?.appName ??
+      readString(integrationConfig['appName']) ??
+      providerProjectId
+
+    const stageDefaultUrl =
+      stage === 'production'
+        ? project.productionUrl ?? undefined
+        : stage === 'staging'
+          ? project.stagingUrl ?? undefined
+          : undefined
+
+    const url =
+      environmentOverride?.url ??
+      readString(integrationConfig[`${stage}Url`]) ??
+      stageDefaultUrl
+
+    const serviceId =
+      environmentOverride?.serviceId ??
+      providerOverride?.serviceId ??
+      readString(integrationConfig['serviceId'])
+
+    const environmentId =
+      environmentOverride?.environmentId ??
+      providerOverride?.[stageEnvKey as keyof ProviderConfigOverride] ??
+      readString(integrationConfig[stageEnvKey])
+
+    const teamId =
+      environmentOverride?.teamId ??
+      providerOverride?.teamId ??
+      readString(integrationConfig['teamId'])
+
+    const costRateUsdPerMinute =
+      environmentOverride?.costRateUsdPerMinute ??
+      providerOverride?.costRateUsdPerMinute ??
+      readNumber(integrationConfig['costRateUsdPerMinute']) ??
+      DEFAULT_PROVIDER_COST_RATES_USD_PER_MINUTE[provider]
+
+    if (provider === 'fly' && !appName) {
+      throw new Error(`Missing Fly appName for ${stage} environment`) 
+    }
+
+    if (provider === 'railway' && !serviceId) {
+      throw new Error(`Missing Railway serviceId for ${stage} environment`) 
+    }
+
+    if (provider !== 'fly' && !providerProjectId) {
+      throw new Error(`Missing provider project identifier for ${provider}:${stage}`)
+    }
+
+    const env: EnvironmentConfig = {
+      name: stage,
+      provider,
+      providerProjectId: providerProjectId ?? appName ?? '',
+      token,
+      costRateUsdPerMinute,
+    }
+
+    if (url) env.url = url
+    if (teamId) env.teamId = teamId
+    if (serviceId) env.serviceId = serviceId
+    if (environmentId) env.environmentId = environmentId
+    if (appName) env.appName = appName
+
+    return env
+  }
+
+  private providerTokenFromEnv(provider: DeployProvider): string | undefined {
+    if (provider === 'vercel') return process.env['VERCEL_TOKEN']
+    if (provider === 'railway') return process.env['RAILWAY_TOKEN']
+    return process.env['FLY_API_TOKEN']
+  }
+
+  private buildStagePlan(target: DeployEnvironmentName): DeployEnvironmentName[] {
+    if (target === 'preview') return ['preview']
+    if (target === 'staging') return ['preview', 'staging']
+    return ['preview', 'staging', 'production']
+  }
+
+  private assertAllowedDeploymentWindow(
+    at: Date,
+    windows: TimeWindow[],
+    overrideFrozenWindow: boolean,
+  ): void {
+    if (overrideFrozenWindow) {
+      return
+    }
+
+    for (const window of windows) {
+      if (isInTimeWindow(at, window)) {
+        throw new Error(
+          `Production deployment blocked by freeze window (UTC day ${at.getUTCDay()}, hour ${at.getUTCHours()})`,
+        )
+      }
+    }
+  }
+
+  private async calculateDeploymentConfidence(
+    task: AgentTask,
+    payload: Pick<
+      DeployTaskPayload,
+      | 'commitSha'
+      | 'changedFiles'
+      | 'ciPassing'
+      | 'ciCoverage'
+      | 'securityScanPassed'
+    >,
+  ): Promise<ConfidenceScore> {
+    const latestStaging = await prisma.deployment.findFirst({
+      where: {
+        projectId: task.projectId,
+        environment: 'STAGING' as never,
+        status: 'SUCCEEDED' as never,
+      },
+      orderBy: { completedAt: 'desc' },
+    })
+
+    const stagingMinutesStable =
+      latestStaging?.completedAt
+        ? Math.max(
+            0,
+            Math.floor((this.now().getTime() - latestStaging.completedAt.getTime()) / 60_000),
+          )
+        : undefined
+
+    const metrics = await this.fetchCurrentMetrics(task.projectId)
+    const security = await this.fetchSecuritySignals(task.projectId)
+
+    const inputs: ConfidenceInputs = {
+      projectId: task.projectId,
+      ciPassing: payload.ciPassing ?? true,
+      securityScanPassed: payload.securityScanPassed ?? security.scanPassed,
+      deploymentTime: this.now(),
+    }
+
+    if (payload.commitSha) inputs.commitSha = payload.commitSha
+    if (payload.changedFiles && payload.changedFiles.length > 0) {
+      inputs.changedFiles = payload.changedFiles
+    }
+    if (payload.ciCoverage !== undefined) inputs.ciCoverage = payload.ciCoverage
+    if (latestStaging?.completedAt) inputs.stagingDeployedAt = latestStaging.completedAt
+    if (stagingMinutesStable !== undefined) {
+      inputs.stagingMinutesStable = stagingMinutesStable
+    }
+    if (metrics.errorRate > 0) inputs.stagingErrorRate = metrics.errorRate
+    if (security.criticalVulnerabilities > 0) {
+      inputs.criticalVulnerabilities = security.criticalVulnerabilities
+    }
+    if (security.highVulnerabilities > 0) {
+      inputs.highVulnerabilities = security.highVulnerabilities
+    }
+    if (security.secretsFound) {
+      inputs.secretsFound = true
+    }
+
+    return this.confidenceEngine.compute(inputs)
+  }
+
+  private async assertProductionPromotionGate(
+    projectId: string,
+    stageResults: StageDeployResult[],
+    confidenceScore: ConfidenceScore,
+    gates: PromotionGates,
+  ): Promise<void> {
+    const stagingResult = stageResults.find(
+      (stage) => stage.environment === 'staging' && stage.status === 'succeeded',
+    )
+
+    if (!stagingResult) {
+      throw new Error('Cannot promote to production without successful staging deployment')
+    }
+
+    const stagingAgeMinutes = Math.floor(
+      (this.now().getTime() - stagingResult.completedAt.getTime()) / 60_000,
+    )
+    if (stagingAgeMinutes < gates.minStagingMinutes) {
+      throw new Error(
+        `Staging must be stable for at least ${gates.minStagingMinutes} minutes before production promotion`,
+      )
+    }
+
+    if (confidenceScore.total < gates.minConfidenceScore) {
+      throw new Error(
+        `Confidence score ${confidenceScore.total}/100 is below required ${gates.minConfidenceScore}/100`,
+      )
+    }
+
+    const errorRateDelta = await this.fetchErrorRateDelta(projectId)
+    if (errorRateDelta > gates.maxErrorRateDelta) {
+      throw new Error(
+        `Error rate delta ${errorRateDelta.toFixed(4)} exceeds allowed threshold ${gates.maxErrorRateDelta.toFixed(4)}`,
+      )
+    }
+  }
+
+  private async ensureProductionApproval(
+    task: AgentTask,
+    payload: Pick<DeployTaskPayload, 'forceApproval'>,
+    confidenceScore: ConfidenceScore,
+    stageResults: StageDeployResult[],
+  ): Promise<void> {
+    const existingApproval = await prisma.approvalRequest.findUnique({
+      where: { taskId: task.id },
+    })
+
+    const requiresApproval =
+      payload.forceApproval || confidenceScore.recommendation !== 'auto_deploy'
+
+    if (!requiresApproval) {
+      return
+    }
+
+    if (existingApproval) {
+      if (existingApproval.status === 'APPROVED') {
+        return
+      }
+      if (existingApproval.status === 'PENDING') {
+        throw new ApprovalRequiredError(
+          'Production deployment is waiting for approval gateway decision',
+          confidenceScore,
+        )
+      }
+      throw new Error(
+        `Production deployment blocked: approval status is ${existingApproval.status.toLowerCase()}`,
+      )
+    }
+
+    const previewUrl = stageResults.find((stage) => stage.environment === 'preview')?.url
+
+    await this.approvalGateway.createApproval({
+      task,
+      title: `Deploy to production (${confidenceScore.total}/100 confidence)`,
+      businessImpact:
+        'Production release requested. This change affects live users and requires explicit confirmation.',
+      technicalDetails: JSON.stringify(
+        {
+          confidence: confidenceScore,
+          rollout: ['preview', 'staging', 'production'],
+          riskFactors: confidenceScore.riskFactors,
+        },
+        null,
+        2,
+      ).slice(0, 1000),
+      confidenceScore,
+      riskLevel: this.riskLevelForRecommendation(confidenceScore.recommendation),
+      previewUrl,
+    })
+
+    throw new ApprovalRequiredError(
+      `Approval required for production deployment (confidence ${confidenceScore.total}/100)`,
+      confidenceScore,
+    )
+  }
+
+  private riskLevelForRecommendation(
+    recommendation: ConfidenceRecommendation,
+  ): 'low' | 'medium' | 'high' | 'critical' {
+    if (recommendation === 'auto_deploy') return 'low'
+    if (recommendation === 'recommend') return 'medium'
+    if (recommendation === 'hold') return 'high'
+    return 'critical'
+  }
+
+  private async deployEnvironment(
+    task: AgentTask,
+    environment: EnvironmentConfig,
+    payload: Pick<DeployTaskPayload, 'commitSha' | 'commitMessage' | 'branch'>,
+    confidenceScore: ConfidenceScore,
+  ): Promise<StageDeployResult> {
+    const startedAt = this.now()
+
+    const deployment = await prisma.deployment.create({
+      data: {
+        projectId: task.projectId,
+        environment: toDbEnvironment(environment.name) as never,
+        status: 'IN_PROGRESS' as never,
+        provider: environment.provider,
+        commitSha: payload.commitSha,
+        commitMessage: payload.commitMessage,
+        branch: payload.branch,
+        triggeredBy: task.requestedBy,
+      },
+    })
+
+    try {
+      const providerResponse = await this.callProviderDeploy(environment, payload)
+      const completedAt = this.now()
+      const durationMs = Math.max(0, completedAt.getTime() - startedAt.getTime())
+      const resolvedUrl = providerResponse.url ?? environment.url
+      const estimatedCostUsd = this.estimateDeploymentCost(
+        environment.provider,
+        durationMs,
+        environment.costRateUsdPerMinute,
+      )
+
+      await prisma.deployment.update({
+        where: { id: deployment.id },
+        data: {
+          status: 'SUCCEEDED' as never,
+          externalId: providerResponse.externalId,
+          url: resolvedUrl,
+          completedAt,
+          durationMs,
+        },
+      })
+
+      await this.persistDeploymentCost(
+        task,
+        deployment.id,
+        environment.provider,
+        durationMs,
+        estimatedCostUsd,
+      )
+
+      const stageResult: StageDeployResult = {
+        deploymentId: deployment.id,
+        projectId: task.projectId,
+        environment: environment.name,
+        provider: environment.provider,
+        status: 'succeeded',
+        startedAt,
+        completedAt,
+        durationMs,
+        estimatedCostUsd,
+        summary: `Deployed ${environment.name} on ${environment.provider} (${confidenceScore.total}/100 confidence)`,
+      }
+
+      if (resolvedUrl) {
+        stageResult.url = resolvedUrl
+      }
+
+      if (payload.commitSha) {
+        stageResult.commitSha = payload.commitSha
+      }
+
+      if (providerResponse.externalId) {
+        stageResult.externalId = providerResponse.externalId
+      }
+
+      return stageResult
+    } catch (err) {
+      const completedAt = this.now()
+      const durationMs = Math.max(0, completedAt.getTime() - startedAt.getTime())
+      await this.markDeploymentFailed(deployment.id, completedAt, durationMs, err)
+      throw err
+    }
+  }
+
+  private async markDeploymentFailed(
+    deploymentId: string,
+    completedAt: Date,
+    durationMs: number,
+    err: unknown,
+  ): Promise<void> {
+    const message = err instanceof Error ? err.message : String(err)
+    try {
+      await prisma.deployment.update({
+        where: { id: deploymentId },
+        data: {
+          status: 'FAILED' as never,
+          rollbackReason: message.slice(0, 500),
+          completedAt,
+          durationMs,
+        },
+      })
+    } catch (updateErr) {
+      log.error(
+        { deploymentId, err: updateErr },
+        'Failed to mark deployment as failed',
+      )
+    }
+  }
+
+  private async monitorPostDeployment(
+    task: AgentTask,
+    stageResult: StageDeployResult,
+    rollbackConfig: RollbackConfig,
+  ): Promise<void> {
+    const checks = Math.max(
+      1,
+      Math.floor(
+        (rollbackConfig.observationWindowMinutes * 60_000) /
+          Math.max(1, rollbackConfig.healthCheckIntervalMs),
+      ),
+    )
+
+    for (let attempt = 0; attempt < checks; attempt += 1) {
+      if (attempt > 0) {
+        await this.sleepFn(rollbackConfig.healthCheckIntervalMs)
+      }
+
+      const rolledBack = await this.checkAutoRollbackTriggers(
+        stageResult.deploymentId,
+        task.projectId,
+        rollbackConfig,
+      )
+
+      if (rolledBack) {
+        log.warn(
+          {
+            taskId: task.id,
+            projectId: task.projectId,
+            deploymentId: stageResult.deploymentId,
+          },
+          'Auto-rollback executed during post-deploy monitoring',
+        )
+        return
+      }
+    }
+  }
+
+  private async executeAutoRollbackForStage(
+    task: AgentTask,
+    stageResult: StageDeployResult,
+    reason: string,
+  ): Promise<void> {
+    const rollbackTask: AgentTask = {
+      id: randomUUID(),
+      type: 'rollback',
+      priority: 'critical',
+      projectId: task.projectId,
+      organizationId: task.organizationId,
+      payload: {
+        action: 'rollback',
+        environment: stageResult.environment,
+        reason,
+        provider: stageResult.provider,
+        excludeDeploymentId: stageResult.deploymentId,
+        automatic: true,
+      },
+      requestedBy: 'system',
+      autonomyLevel: 'autonomous',
+      createdAt: this.now(),
     }
 
     await this.triggerRollback(rollbackTask)
 
-    await this.notifyAutoRollback(projectId, deploymentId, causeText, {
-      errorRateBefore: baseline.errorRate,
-      errorRateAfter: current.errorRate,
-      p99Before: baseline.p99LatencyMs,
-      p99After: current.p99LatencyMs,
-      triggeredAt: new Date(),
+    await prisma.deployment.update({
+      where: { id: stageResult.deploymentId },
+      data: {
+        status: 'ROLLED_BACK' as never,
+        autoRolledBack: true,
+        rollbackReason: reason,
+      },
     })
 
-    return true
+    await prisma.incident.create({
+      data: {
+        projectId: task.projectId,
+        title: `Auto-rollback: ${stageResult.environment}`,
+        description: reason,
+        severity: 'CRITICAL' as never,
+        status: 'RESOLVED' as never,
+        affectedModules: ['deployment'],
+        deploymentId: stageResult.deploymentId,
+        detectedAt: this.now(),
+        resolvedAt: this.now(),
+      },
+    })
   }
 
-  /**
-   * Evaluates all promotion rules before a production deploy.
-   * Rules: staging age, CI, security, confidence score, error rate delta,
-   * human approval, and blocked time windows (Fri 3pm - Mon 9am UTC).
-   */
-  private async checkPromotionRules(
-    projectId: string,
-    pipeline: DeploymentPipeline,
-  ): Promise<{ allowed: boolean; reason: string }> {
-    const rule = pipeline.promotionRules.find((r) => r.to === 'production')
-    if (!rule) return { allowed: true, reason: 'No promotion rule configured' }
+  private async callProviderDeploy(
+    environment: EnvironmentConfig,
+    payload: Pick<DeployTaskPayload, 'commitSha' | 'branch'>,
+  ): Promise<ProviderDeployResponse> {
+    if (environment.provider === 'vercel') {
+      return this.deployToVercel(environment, payload)
+    }
+    if (environment.provider === 'railway') {
+      return this.deployToRailway(environment, payload)
+    }
+    return this.deployToFly(environment, payload)
+  }
 
-    const { conditions } = rule
+  private async callProviderRollback(
+    environment: EnvironmentConfig,
+    targetDeployment: {
+      id: string
+      externalId: string | null
+      commitSha: string | null
+      provider: string
+    },
+  ): Promise<void> {
+    if (environment.provider === 'vercel') {
+      await this.rollbackOnVercel(environment, targetDeployment)
+      return
+    }
+    if (environment.provider === 'railway') {
+      await this.rollbackOnRailway(environment, targetDeployment)
+      return
+    }
+    await this.rollbackOnFly(environment, targetDeployment)
+  }
 
-    // Built-in weekend freeze + any custom windows
-    const effectiveWindows = [
-      ...conditions.blockedTimeWindows,
-      { dayOfWeek: [5], startHour: 15, endHour: 24 },
-      { dayOfWeek: [6], startHour: 0,  endHour: 24 },
-      { dayOfWeek: [0], startHour: 0,  endHour: 9  },
-      { dayOfWeek: [1], startHour: 0,  endHour: 9  },
-    ]
+  private async deployToVercel(
+    environment: EnvironmentConfig,
+    payload: Pick<DeployTaskPayload, 'commitSha' | 'branch'>,
+  ): Promise<ProviderDeployResponse> {
+    const query = environment.teamId
+      ? `?teamId=${encodeURIComponent(environment.teamId)}`
+      : ''
 
-    const now = new Date()
-    const day = now.getUTCDay()
-    const hr  = now.getUTCHours()
+    const body: Record<string, unknown> = {
+      name: environment.providerProjectId,
+      project: environment.providerProjectId,
+      target: environment.name === 'production' ? 'production' : 'preview',
+      meta: {
+        forgeEnvironment: environment.name,
+      },
+    }
 
-    for (const win of effectiveWindows) {
-      const dayMatch = !win.dayOfWeek || win.dayOfWeek.includes(day)
-      const hrMatch  = hr >= win.startHour && hr < win.endHour
-      if (dayMatch && hrMatch) {
-        return { allowed: false, reason: `Production deploy blocked: frozen time window (UTC day=${day}, hour=${hr})` }
+    const ref = payload.branch ?? payload.commitSha
+    if (ref) {
+      body['gitSource'] = {
+        type: 'github',
+        ref,
       }
     }
 
-    const stagingAge = await this.fetchStagingAge(projectId)
-    if (stagingAge < conditions.minStagingAge) {
-      return { allowed: false, reason: `Staging build is ${stagingAge}min old; min required: ${conditions.minStagingAge}min` }
-    }
+    const response = await this.requestJson<{ id?: string; url?: string }>(
+      `https://api.vercel.com/v13/deployments${query}`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${environment.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      },
+      'Vercel deploy API',
+    )
 
-    if (conditions.ciMustPass && !(await this.fetchCiStatus(projectId))) {
-      return { allowed: false, reason: 'CI checks are not passing' }
+    return {
+      externalId: response.id,
+      url: normalizeDeploymentUrl(response.url) ?? environment.url,
     }
-
-    if (conditions.securityMustPass && !(await this.fetchSecurityStatus(projectId))) {
-      return { allowed: false, reason: 'Open critical/high security findings must be resolved' }
-    }
-
-    const confidence = await this.fetchConfidenceScore(projectId)
-    if (confidence < conditions.confidenceMinScore) {
-      return { allowed: false, reason: `Confidence score ${confidence} below minimum ${conditions.confidenceMinScore}` }
-    }
-
-    const errorRateDelta = await this.fetchErrorRateDelta(projectId)
-    if (errorRateDelta > conditions.maxErrorRateDelta) {
-      return { allowed: false, reason: `Staging error rate delta ${errorRateDelta.toFixed(4)} exceeds max ${conditions.maxErrorRateDelta}` }
-    }
-
-    if (conditions.requireApproval && !(await this.fetchApprovalStatus(projectId))) {
-      return { allowed: false, reason: 'Awaiting human approval for production promotion' }
-    }
-
-    return { allowed: true, reason: 'All promotion conditions satisfied' }
   }
 
-  // Private: provider API calls
+  private async deployToRailway(
+    environment: EnvironmentConfig,
+    payload: Pick<DeployTaskPayload, 'commitSha'>,
+  ): Promise<ProviderDeployResponse> {
+    if (!environment.serviceId) {
+      throw new Error(`Railway serviceId is required for ${environment.name}`)
+    }
 
-  /**
-   * Calls the deployment API for the given provider.
-   * Vercel: REST API. Railway: REST API. Render: REST API. Fly: flyctl CLI.
-   */
-  private async callProviderDeploy(env: Environment, commitSha?: string): Promise<string | undefined> {
-    log.info({ provider: env.provider, providerId: env.providerId, commitSha }, 'Calling provider deploy API')
-
-    switch (env.provider) {
-      case 'vercel':
-        log.info({ providerId: env.providerId }, '[VERCEL] Triggering deployment')
-        return env.url
-      case 'railway':
-        log.info({ providerId: env.providerId }, '[RAILWAY] Triggering deployment')
-        return env.url
-      case 'render':
-        log.info({ providerId: env.providerId }, '[RENDER] Triggering deployment')
-        return env.url
-      case 'fly':
-        log.info({ providerId: env.providerId }, '[FLY] Triggering deployment via flyctl')
-        return `https://${env.providerId}.fly.dev`
-      default: {
-        const _exhaustive: never = env.provider
-        throw new Error(`Unknown provider: ${_exhaustive}`)
+    const query = `
+      mutation ForgeDeploy($projectId: String!, $serviceId: String!, $environmentId: String, $commitSha: String) {
+        deploymentCreate(input: {
+          projectId: $projectId,
+          serviceId: $serviceId,
+          environmentId: $environmentId,
+          commitSha: $commitSha
+        }) {
+          id
+          url
+        }
       }
+    `
+
+    const data = await this.requestGraphQl<{
+      deploymentCreate?: { id?: string; url?: string }
+      serviceInstanceDeploy?: { id?: string; url?: string }
+    }>(
+      'https://backboard.railway.app/graphql/v2',
+      environment.token,
+      query,
+      {
+        projectId: environment.providerProjectId,
+        serviceId: environment.serviceId,
+        environmentId: environment.environmentId ?? null,
+        commitSha: payload.commitSha ?? null,
+      },
+      'Railway deploy API',
+    )
+
+    const deployment = data.deploymentCreate ?? data.serviceInstanceDeploy
+    if (!deployment) {
+      throw new Error('Railway deploy API returned no deployment payload')
+    }
+
+    return {
+      externalId: deployment.id,
+      url: normalizeDeploymentUrl(deployment.url) ?? environment.url,
     }
   }
 
-  /** Calls the provider rollback API to restore a previous deployment. */
-  private async callProviderRollback(env: Environment, target: DeploymentRecord): Promise<void> {
-    log.warn({ provider: env.provider, targetCommit: target.commitSha }, 'Calling provider rollback API')
-    switch (env.provider) {
-      case 'vercel':
-        log.warn({ providerId: env.providerId }, '[VERCEL] Rolling back')
-        break
-      case 'railway':
-        log.warn({ providerId: env.providerId }, '[RAILWAY] Rolling back')
-        break
-      case 'render':
-        log.warn({ providerId: env.providerId }, '[RENDER] Rolling back')
-        break
-      case 'fly':
-        log.warn({ providerId: env.providerId }, '[FLY] Rolling back via flyctl')
-        break
-      default: {
-        const _exhaustive: never = env.provider
-        throw new Error(`Unknown provider: ${_exhaustive}`)
+  private async deployToFly(
+    environment: EnvironmentConfig,
+    payload: Pick<DeployTaskPayload, 'commitSha'>,
+  ): Promise<ProviderDeployResponse> {
+    const appName = environment.appName ?? environment.providerProjectId
+    if (!appName) {
+      throw new Error(`Fly appName is required for ${environment.name}`)
+    }
+
+    const query = `
+      mutation ForgeFlyDeploy($appName: String!, $buildTag: String) {
+        deployImage(input: {
+          appName: $appName,
+          strategy: ROLLING,
+          imageTag: $buildTag
+        }) {
+          release {
+            id
+          }
+        }
       }
+    `
+
+    const data = await this.requestGraphQl<{
+      deployImage?: { release?: { id?: string } }
+    }>(
+      'https://api.fly.io/graphql',
+      environment.token,
+      query,
+      {
+        appName,
+        buildTag: payload.commitSha ?? null,
+      },
+      'Fly deploy API',
+    )
+
+    return {
+      externalId: data.deployImage?.release?.id,
+      url: environment.url ?? `https://${appName}.fly.dev`,
     }
   }
 
-  /** Fetches cost breakdown from a provider. Returns zeros as placeholder. */
-  private async fetchProviderCosts(
-    projectId: string,
-    env: Environment,
-  ): Promise<CostRecord['breakdown']> {
-    log.info({ provider: env.provider, projectId }, 'Fetching provider costs')
-    return { hosting: 0, aiApiCalls: 0, database: 0, storage: 0, monitoring: 0, thirdPartyServices: 0 }
-  }
-
-  /**
-   * Generates a human-readable cost spike explanation with projected monthly cost.
-   * Example: "AI API costs up 40% this week. Projected monthly: ."
-   */
-  private generateCostSpikeExplanation(
-    category: string,
-    changePercent: number,
-    currentAmount: number,
-    previousAmount: number,
-  ): string {
-    const pct     = changePercent.toFixed(0)
-    const monthly = (currentAmount * 4.33).toFixed(2)
-    const prev    = previousAmount.toFixed(2)
-    const curr    = currentAmount.toFixed(2)
-    const labels: Record<string, string> = {
-      aiApiCalls: 'AI API', hosting: 'hosting', database: 'database',
-      storage: 'storage', monitoring: 'monitoring', thirdPartyServices: 'third-party services',
+  private async rollbackOnVercel(
+    environment: EnvironmentConfig,
+    targetDeployment: {
+      id: string
+      externalId: string | null
+    },
+  ): Promise<void> {
+    if (!targetDeployment.externalId) {
+      throw new Error('Cannot rollback on Vercel without target external deployment ID')
     }
-    const label = labels[category] ?? category
-    return (
-      `Your ${label} costs increased ${pct}% this week (${prev} -> ${curr}). `
-      + `At current growth, projected monthly cost is $${monthly}.`
+
+    const query = environment.teamId
+      ? `?teamId=${encodeURIComponent(environment.teamId)}`
+      : ''
+
+    await this.requestJson<Record<string, unknown>>(
+      `https://api.vercel.com/v13/deployments/${encodeURIComponent(targetDeployment.externalId)}/promote${query}`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${environment.token}`,
+          'Content-Type': 'application/json',
+        },
+      },
+      'Vercel rollback API',
     )
   }
 
-  // -------------------------------------------------------------------------
-  // Private: post-deploy monitoring
-  // -------------------------------------------------------------------------
-
-  /**
-   * Monitors post-deploy metrics for the observation window and triggers
-   * auto-rollback if any threshold is breached. Runs non-blocking.
-   */
-  private async monitorPostDeploy(
-    deploymentId: string,
-    projectId: string,
-    deployUrl: string | undefined,
-    config: RollbackConfig,
+  private async rollbackOnRailway(
+    environment: EnvironmentConfig,
+    targetDeployment: {
+      externalId: string | null
+    },
   ): Promise<void> {
-    const mLog = createContextLogger('devops-agent', { deploymentId, projectId })
-    mLog.info({ deployUrl, windowMinutes: config.observationWindowMinutes }, 'Starting post-deploy monitoring')
-
-    const endTime = Date.now() + config.observationWindowMinutes * 60_000
-    while (Date.now() < endTime) {
-      await sleep(60_000)
-      const rolledBack = await this.checkAutoRollbackTriggers(deploymentId, projectId)
-      if (rolledBack) {
-        mLog.warn('Auto-rollback fired during observation window; monitor stopping')
-        return
-      }
+    if (!targetDeployment.externalId) {
+      throw new Error('Cannot rollback on Railway without target external deployment ID')
     }
-    mLog.info('Observation window passed without incident')
-  }
 
-  // -------------------------------------------------------------------------
-  // Private: DB helpers
-  // -------------------------------------------------------------------------
-
-  /** Fetches the deployment pipeline config for a project from the DB. */
-  private async fetchDeploymentPipeline(projectId: string): Promise<DeploymentPipeline> {
-    const rows = await prisma.$queryRaw<
-      Array<{ config: DeploymentPipeline }>
-    >`
-      SELECT config
-      FROM deployment_pipelines
-      WHERE project_id = ${projectId}::uuid
-      LIMIT 1
+    const query = `
+      mutation ForgeRailwayRollback($deploymentId: String!) {
+        rollbackDeployment(id: $deploymentId) {
+          id
+        }
+      }
     `
 
-    if (rows.length === 0) {
-      // Return a safe default pipeline for projects without explicit config
-      return {
+    await this.requestGraphQl<Record<string, unknown>>(
+      'https://backboard.railway.app/graphql/v2',
+      environment.token,
+      query,
+      { deploymentId: targetDeployment.externalId },
+      'Railway rollback API',
+    )
+  }
+
+  private async rollbackOnFly(
+    environment: EnvironmentConfig,
+    targetDeployment: {
+      externalId: string | null
+    },
+  ): Promise<void> {
+    const appName = environment.appName ?? environment.providerProjectId
+    if (!appName) {
+      throw new Error('Cannot rollback on Fly without appName')
+    }
+
+    const query = `
+      mutation ForgeFlyRollback($appName: String!, $releaseId: String) {
+        rollbackRelease(input: {
+          appName: $appName,
+          releaseId: $releaseId
+        }) {
+          release {
+            id
+          }
+        }
+      }
+    `
+
+    await this.requestGraphQl<Record<string, unknown>>(
+      'https://api.fly.io/graphql',
+      environment.token,
+      query,
+      {
+        appName,
+        releaseId: targetDeployment.externalId,
+      },
+      'Fly rollback API',
+    )
+  }
+
+  private async updateDnsRecords(
+    projectId: string,
+    productionEnvironment: EnvironmentConfig,
+    stageResult: StageDeployResult,
+    dnsConfig: DnsUpdateConfig,
+  ): Promise<void> {
+    const provider =
+      dnsConfig.provider ??
+      (productionEnvironment.provider === 'vercel' ? 'vercel' : 'cloudflare')
+
+    if (provider === 'vercel') {
+      await this.updateDnsViaVercel(productionEnvironment, stageResult, dnsConfig)
+    } else {
+      await this.updateDnsViaCloudflare(dnsConfig)
+    }
+
+    const organizationId = await this.fetchOrganizationId(projectId)
+    await prisma.auditLog.create({
+      data: {
         projectId,
-        environments: [],
-        promotionRules: [],
-        rollbackConfig: {
-          errorRateMultiplierThreshold: 1.5,
-          p99LatencyMultiplierThreshold: 3.0,
-          healthCheckFailureThreshold: 3,
-          observationWindowMinutes: 10,
+        organizationId,
+        actor: 'agent:devops:dns',
+        actorType: 'agent',
+        action: 'deployment.dns_updated',
+        resourceType: 'deployment',
+        resourceId: stageResult.deploymentId,
+        outcome: 'success',
+        metadata: {
+          provider,
+          records: dnsConfig.records,
         },
+      },
+    })
+  }
+
+  private async updateDnsViaVercel(
+    productionEnvironment: EnvironmentConfig,
+    stageResult: StageDeployResult,
+    dnsConfig: DnsUpdateConfig,
+  ): Promise<void> {
+    const projectId = dnsConfig.projectId ?? productionEnvironment.providerProjectId
+    const token = dnsConfig.token ?? productionEnvironment.token
+
+    if (!projectId) {
+      throw new Error('Vercel DNS update requires a projectId')
+    }
+    if (!token) {
+      throw new Error('Vercel DNS update requires a token')
+    }
+
+    for (const record of dnsConfig.records) {
+      try {
+        await this.requestJson<Record<string, unknown>>(
+          `https://api.vercel.com/v10/projects/${encodeURIComponent(projectId)}/domains`,
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${token}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ name: record.name }),
+          },
+          'Vercel DNS update API',
+        )
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        if (!message.toLowerCase().includes('already')) {
+          throw err
+        }
+      }
+
+      if (stageResult.externalId && record.type === 'CNAME') {
+        await this.requestJson<Record<string, unknown>>(
+          `https://api.vercel.com/v2/deployments/${encodeURIComponent(stageResult.externalId)}/aliases`,
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${token}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ alias: record.name }),
+          },
+          'Vercel alias update API',
+        )
+      }
+    }
+  }
+
+  private async updateDnsViaCloudflare(dnsConfig: DnsUpdateConfig): Promise<void> {
+    const token = dnsConfig.token ?? process.env['CLOUDFLARE_API_TOKEN']
+    const zoneId = dnsConfig.zoneId
+
+    if (!token) {
+      throw new Error('Cloudflare DNS update requires token or CLOUDFLARE_API_TOKEN')
+    }
+
+    if (!zoneId) {
+      throw new Error('Cloudflare DNS update requires zoneId')
+    }
+
+    for (const record of dnsConfig.records) {
+      const response = await this.requestJson<{
+        success?: boolean
+        errors?: Array<{ message?: string }>
+      }>(
+        `https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(zoneId)}/dns_records`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            type: record.type,
+            name: record.name,
+            content: record.value,
+            ttl: record.ttl ?? 1,
+            proxied: record.proxied ?? false,
+          }),
+        },
+        'Cloudflare DNS update API',
+      )
+
+      if (!response.success) {
+        const message =
+          response.errors?.map((item) => item.message).filter(Boolean).join('; ') ||
+          'Cloudflare API returned success=false'
+        throw new Error(message)
+      }
+    }
+  }
+
+  private async runConsecutiveHealthChecks(
+    deployUrl: string | undefined,
+    failureThreshold: number,
+    intervalMs: number,
+  ): Promise<HealthCheckResult> {
+    if (!deployUrl) {
+      return {
+        healthy: false,
+        statusCode: 0,
+        latencyMs: 0,
+        checkedAt: this.now(),
+        failures: failureThreshold,
       }
     }
 
-    return rows[0]
+    const checks = Math.max(1, failureThreshold)
+    let consecutiveFailures = 0
+    let totalFailures = 0
+    let latest: HealthCheckResult = {
+      healthy: true,
+      statusCode: 200,
+      latencyMs: 0,
+      checkedAt: this.now(),
+      failures: 0,
+    }
+
+    for (let attempt = 0; attempt < checks; attempt += 1) {
+      latest = await this.runSingleHealthCheck(deployUrl)
+      if (latest.healthy) {
+        consecutiveFailures = 0
+      } else {
+        consecutiveFailures += 1
+        totalFailures += 1
+      }
+
+      if (consecutiveFailures >= failureThreshold) {
+        return {
+          ...latest,
+          healthy: false,
+          failures: totalFailures,
+        }
+      }
+
+      if (attempt < checks - 1) {
+        await this.sleepFn(intervalMs)
+      }
+    }
+
+    return {
+      ...latest,
+      healthy: totalFailures === 0,
+      failures: totalFailures,
+    }
   }
 
-  /** Persists a deployment record (INSERT; never UPDATE). */
-  private async persistDeploymentRecord(record: DeploymentRecord): Promise<void> {
-    await prisma.$executeRaw`
-      INSERT INTO deployments (
-        id, project_id, environment, status, provider,
-        commit_sha, commit_message, url, started_at
-      ) VALUES (
-        ${record.id}, ${record.projectId}::uuid, ${record.environment},
-        ${record.status}, ${record.provider},
-        ${record.commitSha ?? null}, ${record.commitMessage ?? null},
-        ${record.url ?? null}, NOW()
-      )
-    `
+  private async runSingleHealthCheck(baseUrl: string): Promise<HealthCheckResult> {
+    const normalizedBase = baseUrl.replace(/\/+$/, '')
+    const targets = [
+      `${normalizedBase}/health`,
+      `${normalizedBase}/api/health`,
+      normalizedBase,
+    ]
+
+    let lastStatusCode = 0
+    let lastLatencyMs = 0
+
+    for (const target of targets) {
+      const started = Date.now()
+      try {
+        const response = await this.fetchWithTimeout(target, {
+          method: 'GET',
+          headers: { 'User-Agent': 'forge-devops-agent/1.0' },
+        })
+        const latencyMs = Date.now() - started
+
+        if (response.ok) {
+          return {
+            healthy: true,
+            statusCode: response.status,
+            latencyMs,
+            checkedAt: this.now(),
+            failures: 0,
+          }
+        }
+
+        lastStatusCode = response.status
+        lastLatencyMs = latencyMs
+      } catch {
+        lastStatusCode = 0
+        lastLatencyMs = Date.now() - started
+      }
+    }
+
+    return {
+      healthy: false,
+      statusCode: lastStatusCode,
+      latencyMs: lastLatencyMs,
+      checkedAt: this.now(),
+      failures: 1,
+    }
   }
 
-  /** Updates the status (and optionally URL) of an existing deployment. */
-  private async updateDeploymentStatus(id: string, status: string, url?: string): Promise<void> {
-    await prisma.$executeRaw`
-      UPDATE deployments
-      SET status = ${status},
-          url = COALESCE(${url ?? null}, url),
-          completed_at = NOW()
-      WHERE id = ${id}
-    `
-  }
-
-  /** Fetches the last successful deployment for a given environment. */
-  private async fetchLastSuccessfulDeployment(
+  private async fetchPreDeployMetrics(
     projectId: string,
-    environment: string,
-  ): Promise<DeploymentRecord | null> {
-    const rows = await prisma.$queryRaw<DeploymentRecord[]>`
-      SELECT id, project_id AS projectId, environment, status, provider,
-             commit_sha AS commitSha, commit_message AS commitMessage,
-             url, started_at AS startedAt, completed_at AS completedAt
-      FROM deployments
-      WHERE project_id = ${projectId}::uuid
-        AND environment = ${environment}
-        AND status = 'succeeded'
-      ORDER BY completed_at DESC
-      LIMIT 1
-    `
-    return rows[0] ?? null
+    deployedAt: Date,
+  ): Promise<MetricsSnapshot> {
+    const baseline = await prisma.projectMetricsSnapshot.findFirst({
+      where: {
+        projectId,
+        capturedAt: { lte: deployedAt },
+      },
+      orderBy: { capturedAt: 'desc' },
+    })
+
+    if (!baseline) {
+      return {
+        errorRate: 0,
+        p99LatencyMs: 0,
+        capturedAt: this.now(),
+      }
+    }
+
+    return {
+      errorRate: baseline.errorRate ?? 0,
+      p99LatencyMs: baseline.p99Latency ?? 0,
+      capturedAt: baseline.capturedAt,
+    }
   }
 
-  /** Persists a rollback incident record. */
-  private async persistRollbackIncident(
-    projectId: string,
-    rollbackId: string,
-    reason: string,
-    target: DeploymentRecord,
+  private async fetchCurrentMetrics(projectId: string): Promise<MetricsSnapshot> {
+    const current = await prisma.projectMetricsSnapshot.findFirst({
+      where: { projectId },
+      orderBy: { capturedAt: 'desc' },
+    })
+
+    if (!current) {
+      return {
+        errorRate: 0,
+        p99LatencyMs: 0,
+        capturedAt: this.now(),
+      }
+    }
+
+    return {
+      errorRate: current.errorRate ?? 0,
+      p99LatencyMs: current.p99Latency ?? 0,
+      capturedAt: current.capturedAt,
+    }
+  }
+
+  private async fetchErrorRateDelta(projectId: string): Promise<number> {
+    const snapshots = await prisma.projectMetricsSnapshot.findMany({
+      where: { projectId },
+      orderBy: { capturedAt: 'desc' },
+      take: 2,
+    })
+
+    if (snapshots.length < 2) {
+      return 0
+    }
+
+    const current = snapshots[0]?.errorRate ?? 0
+    const previous = snapshots[1]?.errorRate ?? 0
+    if (previous <= 0) {
+      return current > 0 ? 1 : 0
+    }
+
+    return (current - previous) / previous
+  }
+
+  private async fetchSecuritySignals(projectId: string): Promise<{
+    scanPassed: boolean
+    criticalVulnerabilities: number
+    highVulnerabilities: number
+    secretsFound: boolean
+  }> {
+    const latestScan = await prisma.securityScan.findFirst({
+      where: { projectId },
+      orderBy: { startedAt: 'desc' },
+    })
+
+    if (!latestScan) {
+      return {
+        scanPassed: true,
+        criticalVulnerabilities: 0,
+        highVulnerabilities: 0,
+        secretsFound: false,
+      }
+    }
+
+    const data = asRecord(latestScan.data)
+    const findingsCount = asRecord(latestScan.findingsCount)
+
+    const criticalVulnerabilities =
+      readNumber(data['critical']) ?? readNumber(findingsCount['critical']) ?? 0
+    const highVulnerabilities =
+      readNumber(data['high']) ?? readNumber(findingsCount['high']) ?? 0
+    const secretsFound =
+      (readBoolean(data['secretsFound']) ?? false) ||
+      (readNumber(data['secretsCount']) ?? 0) > 0
+
+    const scanPassed =
+      latestScan.status === 'COMPLETED' &&
+      criticalVulnerabilities === 0 &&
+      !secretsFound
+
+    return {
+      scanPassed,
+      criticalVulnerabilities,
+      highVulnerabilities,
+      secretsFound,
+    }
+  }
+
+  private async persistDeploymentCost(
+    task: AgentTask,
+    deploymentId: string,
+    provider: DeployProvider,
+    durationMs: number,
+    estimatedCostUsd: number,
   ): Promise<void> {
-    await prisma.$executeRaw`
-      INSERT INTO deployment_incidents (project_id, deployment_id, reason, target_commit_sha, created_at)
-      VALUES (${projectId}::uuid, ${rollbackId}, ${reason}, ${target.commitSha ?? null}, NOW())
-    `
+    await prisma.auditLog.create({
+      data: {
+        projectId: task.projectId,
+        organizationId: task.organizationId,
+        actor: `agent:devops:${task.id}`,
+        actorType: 'agent',
+        action: 'deployment.cost',
+        resourceType: 'deployment',
+        resourceId: deploymentId,
+        outcome: 'success',
+        durationMs,
+        metadata: {
+          provider,
+          estimatedCostUsd,
+          durationMs,
+        },
+      },
+    })
   }
 
-  /** Persists a cost record. */
-  private async persistCostRecord(record: CostRecord): Promise<void> {
-    await prisma.$executeRaw`
-      INSERT INTO cost_records (project_id, period, breakdown, total, projected_monthly, anomalies, created_at)
-      VALUES (${record.projectId}::uuid, ${record.period}, ${JSON.stringify(record.breakdown)},
-             ${record.total}, ${record.projectedMonthly}, ${JSON.stringify(record.anomalies)}, NOW())
-    `
+  private estimateDeploymentCost(
+    provider: DeployProvider,
+    durationMs: number,
+    overrideRateUsdPerMinute?: number,
+  ): number {
+    const ratePerMinute =
+      overrideRateUsdPerMinute ?? DEFAULT_PROVIDER_COST_RATES_USD_PER_MINUTE[provider]
+    const minutes = Math.max(durationMs, 1000) / 60_000
+    return roundCurrency(ratePerMinute * minutes)
   }
 
-  /** Fetches the previous week cost record for anomaly comparison. */
-  private async fetchPreviousWeekCost(projectId: string): Promise<CostRecord | null> {
-    const rows = await prisma.$queryRaw<CostRecord[]>`
-      SELECT * FROM cost_records
-      WHERE project_id = ${projectId}::uuid
-        AND period < NOW() - INTERVAL '6 days'
-      ORDER BY period DESC
-      LIMIT 1
-    `
-    return rows[0] ?? null
+  private aggregateProviderCosts(
+    deployments: Array<{
+      provider: string
+      durationMs: number | null
+      startedAt: Date
+      completedAt: Date | null
+    }>,
+  ): ProviderCostBreakdown {
+    const totals = emptyProviderCosts()
+
+    for (const deployment of deployments) {
+      const provider = parseProvider(deployment.provider)
+      if (!provider) {
+        continue
+      }
+
+      const inferredDurationMs =
+        deployment.durationMs ??
+        (deployment.completedAt
+          ? Math.max(0, deployment.completedAt.getTime() - deployment.startedAt.getTime())
+          : 0)
+
+      totals[provider] = roundCurrency(
+        totals[provider] + this.estimateDeploymentCost(provider, inferredDurationMs),
+      )
+    }
+
+    return totals
   }
 
-  // -------------------------------------------------------------------------
-  // Private: metric and status fetchers (stubbed; replace with real adapters)
-  // -------------------------------------------------------------------------
-
-  private async fetchRollbackConfig(projectId: string): Promise<RollbackConfig> {
-    const pipeline = await this.fetchDeploymentPipeline(projectId)
-    return pipeline.rollbackConfig
+  private buildCostAnomaly(
+    provider: DeployProvider,
+    current: number,
+    previous: number,
+    changePercent: number,
+    lookbackDays: number,
+  ): CostAnomaly {
+    return {
+      category: `hosting:${provider}`,
+      previousAmount: roundCurrency(previous),
+      currentAmount: roundCurrency(current),
+      changePercent,
+      explanation:
+        `${provider} deployment costs increased ${changePercent.toFixed(1)}% over the last ` +
+        `${lookbackDays} days (${formatUsd(previous)} -> ${formatUsd(current)}).`,
+    }
   }
 
-  private async fetchPreDeployMetrics(_projectId: string): Promise<MetricsSnapshot> {
-    // Production: query metrics adapter (Datadog / Grafana / CloudWatch)
-    return { errorRate: 0, p99LatencyMs: 0, capturedAt: new Date() }
+  private async calculatePlatformCosts(
+    projectId: string,
+    lookbackDays: number,
+  ): Promise<ProviderCostBreakdown> {
+    const start = new Date(this.now().getTime() - lookbackDays * DAY_MS)
+    const deployments = await prisma.deployment.findMany({
+      where: {
+        projectId,
+        completedAt: { gte: start },
+        status: { in: ['SUCCEEDED', 'ROLLED_BACK'] as never[] },
+      },
+    })
+
+    return this.aggregateProviderCosts(deployments)
   }
 
-  private async fetchCurrentMetrics(_projectId: string): Promise<MetricsSnapshot> {
-    return { errorRate: 0, p99LatencyMs: 0, capturedAt: new Date() }
-  }
+  private async fetchRollbackTarget(
+    projectId: string,
+    environment: DeployEnvironmentName,
+    rollbackToDeploymentId?: string,
+    excludeDeploymentId?: string,
+  ): Promise<{
+    id: string
+    externalId: string | null
+    commitSha: string | null
+    branch: string | null
+    url: string | null
+    provider: string
+  } | null> {
+    if (rollbackToDeploymentId) {
+      const explicitTarget = await prisma.deployment.findUnique({
+        where: { id: rollbackToDeploymentId },
+      })
 
-  private async runConsecutiveHealthChecks(_projectId: string, _count: number): Promise<HealthCheckResult> {
-    return { healthy: true, statusCode: 200, latencyMs: 0, checkedAt: new Date() }
-  }
+      if (!explicitTarget) {
+        throw new Error(`Rollback target deployment not found: ${rollbackToDeploymentId}`)
+      }
 
-  private async fetchStagingAge(_projectId: string): Promise<number> {
-    return 60 // minutes
-  }
+      if (explicitTarget.projectId !== projectId) {
+        throw new Error('Rollback target belongs to a different project')
+      }
 
-  private async fetchCiStatus(_projectId: string): Promise<boolean> {
-    return true
-  }
+      if (explicitTarget.environment !== toDbEnvironment(environment)) {
+        throw new Error('Rollback target environment does not match requested rollback')
+      }
 
-  private async fetchSecurityStatus(_projectId: string): Promise<boolean> {
-    return true
-  }
+      if (explicitTarget.status !== 'SUCCEEDED') {
+        throw new Error('Rollback target must be a successful deployment')
+      }
 
-  private async fetchConfidenceScore(_projectId: string): Promise<number> {
-    return 80
-  }
+      return {
+        id: explicitTarget.id,
+        externalId: explicitTarget.externalId,
+        commitSha: explicitTarget.commitSha,
+        branch: explicitTarget.branch,
+        url: explicitTarget.url,
+        provider: explicitTarget.provider,
+      }
+    }
 
-  private async fetchErrorRateDelta(_projectId: string): Promise<number> {
-    return 0
-  }
+    const target = await prisma.deployment.findFirst({
+      where: {
+        projectId,
+        environment: toDbEnvironment(environment) as never,
+        status: 'SUCCEEDED' as never,
+        ...(excludeDeploymentId ? { id: { not: excludeDeploymentId } } : {}),
+      },
+      orderBy: { completedAt: 'desc' },
+    })
 
-  private async fetchApprovalStatus(_projectId: string): Promise<boolean> {
-    return false
+    if (!target) {
+      return null
+    }
+
+    return {
+      id: target.id,
+      externalId: target.externalId,
+      commitSha: target.commitSha,
+      branch: target.branch,
+      url: target.url,
+      provider: target.provider,
+    }
   }
 
   private async fetchOrganizationId(projectId: string): Promise<string> {
-    const rows = await prisma.$queryRaw<Array<{ org_id: string }>>`
-      SELECT organization_id::text AS org_id FROM projects WHERE id = ${projectId}::uuid LIMIT 1
-    `
-    return rows[0]?.org_id ?? projectId
+    const project = await prisma.project.findUnique({
+      where: { id: projectId },
+      select: { organizationId: true },
+    })
+
+    if (!project) {
+      throw new Error(`Project not found: ${projectId}`)
+    }
+
+    return project.organizationId
   }
 
-  // -------------------------------------------------------------------------
-  // Private: notifications
-  // -------------------------------------------------------------------------
+  private async fetchWithTimeout(
+    url: string,
+    init: RequestInit,
+  ): Promise<Response> {
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), API_TIMEOUT_MS)
 
-  private async notifyRollback(
-    projectId: string,
-    environment: string,
-    reason: string,
-    target: DeploymentRecord,
-  ): Promise<void> {
-    log.warn(
-      { projectId, environment, reason, targetCommit: target.commitSha },
-      '[NOTIFICATION] Rollback notification dispatched',
-    )
+    try {
+      return await this.fetchImpl(url, {
+        ...init,
+        signal: controller.signal,
+      })
+    } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') {
+        throw new Error(`Request timed out after ${API_TIMEOUT_MS}ms: ${url}`)
+      }
+      throw err
+    } finally {
+      clearTimeout(timeout)
+    }
   }
 
-  private async notifyAutoRollback(
-    projectId: string,
-    deploymentId: string,
-    causeText: string,
-    metrics: {
-      errorRateBefore: number
-      errorRateAfter: number
-      p99Before: number
-      p99After: number
-      triggeredAt: Date
-    },
-  ): Promise<void> {
-    log.error(
-      { projectId, deploymentId, causeText, ...metrics },
-      '[NOTIFICATION] Auto-rollback alert dispatched with cause and timeline',
+  private async requestJson<T>(
+    url: string,
+    init: RequestInit,
+    context: string,
+  ): Promise<T> {
+    const response = await this.fetchWithTimeout(url, init)
+    const responseText = await response.text()
+
+    if (!response.ok) {
+      throw new Error(
+        `${context} failed with status ${response.status}: ${responseText.slice(0, 400)}`,
+      )
+    }
+
+    if (responseText.trim().length === 0) {
+      return {} as T
+    }
+
+    try {
+      return JSON.parse(responseText) as T
+    } catch {
+      throw new Error(`${context} returned invalid JSON`) 
+    }
+  }
+
+  private async requestGraphQl<TData>(
+    url: string,
+    token: string,
+    query: string,
+    variables: Record<string, unknown>,
+    context: string,
+  ): Promise<TData> {
+    const response = await this.requestJson<{
+      data?: TData
+      errors?: Array<{ message?: string }>
+    }>(
+      url,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query, variables }),
+      },
+      context,
     )
+
+    if (response.errors && response.errors.length > 0) {
+      const message = response.errors
+        .map((item) => item.message)
+        .filter(Boolean)
+        .join('; ')
+      throw new Error(`${context} returned GraphQL errors: ${message}`)
+    }
+
+    if (!response.data) {
+      throw new Error(`${context} returned no data`) 
+    }
+
+    return response.data
   }
 }
 
-// ---------------------------------------------------------------------------
-// Utility
-// ---------------------------------------------------------------------------
-
-/** Promisified sleep helper for the observation window polling loop. */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-// ---------------------------------------------------------------------------
-// Singleton export
-// ---------------------------------------------------------------------------
+function asRecord(value: unknown): Record<string, unknown> {
+  if (typeof value === 'object' && value !== null) {
+    return value as Record<string, unknown>
+  }
+  return {}
+}
 
-/** Pre-instantiated DevOpsAgent singleton for use in the orchestrator. */
+function readString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim().length > 0
+    ? value.trim()
+    : undefined
+}
+
+function readBoolean(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined
+}
+
+function readNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function readStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+  return value
+    .map((item) => readString(item))
+    .filter((item): item is string => item !== undefined)
+}
+
+function parseProvider(value: unknown): DeployProvider | undefined {
+  const normalized = readString(value)?.toLowerCase()
+  return normalized && (DEPLOY_PROVIDERS as readonly string[]).includes(normalized)
+    ? (normalized as DeployProvider)
+    : undefined
+}
+
+function parseEnvironment(value: unknown): DeployEnvironmentName | undefined {
+  const normalized = readString(value)?.toLowerCase()
+  return normalized && (DEPLOY_ENVIRONMENTS as readonly string[]).includes(normalized)
+    ? (normalized as DeployEnvironmentName)
+    : undefined
+}
+
+function parseProviderConfigMap(
+  value: unknown,
+): Partial<Record<DeployProvider, ProviderConfigOverride>> | undefined {
+  const root = asRecord(value)
+  const parsed: Partial<Record<DeployProvider, ProviderConfigOverride>> = {}
+
+  for (const provider of DEPLOY_PROVIDERS) {
+    const source = asRecord(root[provider])
+    if (Object.keys(source).length === 0) {
+      continue
+    }
+
+    const config: ProviderConfigOverride = {}
+    const token = readString(source['token'])
+    if (token) config.token = token
+    const projectId = readString(source['projectId'])
+    if (projectId) config.projectId = projectId
+    const previewProjectId = readString(source['previewProjectId'])
+    if (previewProjectId) config.previewProjectId = previewProjectId
+    const stagingProjectId = readString(source['stagingProjectId'])
+    if (stagingProjectId) config.stagingProjectId = stagingProjectId
+    const productionProjectId = readString(source['productionProjectId'])
+    if (productionProjectId) config.productionProjectId = productionProjectId
+    const teamId = readString(source['teamId'])
+    if (teamId) config.teamId = teamId
+    const serviceId = readString(source['serviceId'])
+    if (serviceId) config.serviceId = serviceId
+    const previewEnvironmentId = readString(source['previewEnvironmentId'])
+    if (previewEnvironmentId) config.previewEnvironmentId = previewEnvironmentId
+    const stagingEnvironmentId = readString(source['stagingEnvironmentId'])
+    if (stagingEnvironmentId) config.stagingEnvironmentId = stagingEnvironmentId
+    const productionEnvironmentId = readString(source['productionEnvironmentId'])
+    if (productionEnvironmentId) config.productionEnvironmentId = productionEnvironmentId
+    const appName = readString(source['appName'])
+    if (appName) config.appName = appName
+    const costRate = readNumber(source['costRateUsdPerMinute'])
+    if (costRate !== undefined) config.costRateUsdPerMinute = costRate
+
+    parsed[provider] = config
+  }
+
+  return Object.keys(parsed).length > 0 ? parsed : undefined
+}
+
+function parseEnvironmentConfigMap(
+  value: unknown,
+): Partial<Record<DeployEnvironmentName, EnvironmentConfigOverride>> | undefined {
+  const root = asRecord(value)
+  const parsed: Partial<Record<DeployEnvironmentName, EnvironmentConfigOverride>> = {}
+
+  for (const stage of DEPLOY_ENVIRONMENTS) {
+    const source = asRecord(root[stage])
+    if (Object.keys(source).length === 0) {
+      continue
+    }
+
+    const config: EnvironmentConfigOverride = {}
+    const token = readString(source['token'])
+    if (token) config.token = token
+    const projectId = readString(source['projectId'])
+    if (projectId) config.projectId = projectId
+    const providerProjectId = readString(source['providerProjectId'])
+    if (providerProjectId) config.providerProjectId = providerProjectId
+    const teamId = readString(source['teamId'])
+    if (teamId) config.teamId = teamId
+    const serviceId = readString(source['serviceId'])
+    if (serviceId) config.serviceId = serviceId
+    const environmentId = readString(source['environmentId'])
+    if (environmentId) config.environmentId = environmentId
+    const appName = readString(source['appName'])
+    if (appName) config.appName = appName
+    const url = readString(source['url'])
+    if (url) config.url = url
+    const costRate = readNumber(source['costRateUsdPerMinute'])
+    if (costRate !== undefined) config.costRateUsdPerMinute = costRate
+
+    parsed[stage] = config
+  }
+
+  return Object.keys(parsed).length > 0 ? parsed : undefined
+}
+
+function parseRollbackConfig(value: unknown): Partial<RollbackConfig> | undefined {
+  const source = asRecord(value)
+  if (Object.keys(source).length === 0) {
+    return undefined
+  }
+
+  const config: Partial<RollbackConfig> = {}
+  const errorRateMultiplierThreshold = readNumber(source['errorRateMultiplierThreshold'])
+  if (errorRateMultiplierThreshold !== undefined) {
+    config.errorRateMultiplierThreshold = errorRateMultiplierThreshold
+  }
+  const p99LatencyMultiplierThreshold = readNumber(source['p99LatencyMultiplierThreshold'])
+  if (p99LatencyMultiplierThreshold !== undefined) {
+    config.p99LatencyMultiplierThreshold = p99LatencyMultiplierThreshold
+  }
+  const healthCheckFailureThreshold = readNumber(source['healthCheckFailureThreshold'])
+  if (healthCheckFailureThreshold !== undefined) {
+    config.healthCheckFailureThreshold = Math.max(1, Math.floor(healthCheckFailureThreshold))
+  }
+  const observationWindowMinutes = readNumber(source['observationWindowMinutes'])
+  if (observationWindowMinutes !== undefined) {
+    config.observationWindowMinutes = Math.max(1, observationWindowMinutes)
+  }
+  const healthCheckIntervalMs = readNumber(source['healthCheckIntervalMs'])
+  if (healthCheckIntervalMs !== undefined) {
+    config.healthCheckIntervalMs = Math.max(1000, healthCheckIntervalMs)
+  }
+
+  return Object.keys(config).length > 0 ? config : undefined
+}
+
+function parseTimeWindows(value: unknown): TimeWindow[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  const parsed: TimeWindow[] = []
+
+  for (const item of value) {
+    const source = asRecord(item)
+    const startHour = readNumber(source['startHour'])
+    const endHour = readNumber(source['endHour'])
+    if (startHour === undefined || endHour === undefined) {
+      continue
+    }
+    if (startHour < 0 || startHour > 24 || endHour < 0 || endHour > 24 || endHour <= startHour) {
+      continue
+    }
+
+    let dayOfWeek: number[] | undefined
+    if (Array.isArray(source['dayOfWeek'])) {
+      const rawDays = source['dayOfWeek']
+        .map((day) => readNumber(day))
+        .filter((day): day is number => day !== undefined)
+        .map((day) => Math.floor(day))
+        .filter((day) => day >= 0 && day <= 6)
+      if (rawDays.length > 0) {
+        dayOfWeek = Array.from(new Set(rawDays))
+      }
+    }
+
+    const window: TimeWindow = {
+      startHour,
+      endHour,
+    }
+    if (dayOfWeek) {
+      window.dayOfWeek = dayOfWeek
+    }
+    parsed.push(window)
+  }
+
+  return parsed
+}
+
+function parseDnsUpdateConfig(value: unknown): DnsUpdateConfig | undefined {
+  const source = asRecord(value)
+  const recordsInput = source['records']
+  if (!Array.isArray(recordsInput) || recordsInput.length === 0) {
+    return undefined
+  }
+
+  const records: DnsRecordChange[] = []
+  for (const recordInput of recordsInput) {
+    const record = asRecord(recordInput)
+    const type = readString(record['type'])?.toUpperCase()
+    if (type !== 'A' && type !== 'AAAA' && type !== 'CNAME') {
+      continue
+    }
+
+    const name = readString(record['name'])
+    const valueString = readString(record['value'])
+    if (!name || !valueString) {
+      continue
+    }
+
+    const parsedRecord: DnsRecordChange = {
+      type,
+      name,
+      value: valueString,
+    }
+
+    const ttl = readNumber(record['ttl'])
+    if (ttl !== undefined) {
+      parsedRecord.ttl = Math.max(1, Math.floor(ttl))
+    }
+
+    const proxied = readBoolean(record['proxied'])
+    if (proxied !== undefined) {
+      parsedRecord.proxied = proxied
+    }
+
+    records.push(parsedRecord)
+  }
+
+  if (records.length === 0) {
+    return undefined
+  }
+
+  const parsedConfig: DnsUpdateConfig = { records }
+
+  const provider = readString(source['provider'])?.toLowerCase()
+  if (provider === 'vercel' || provider === 'cloudflare') {
+    parsedConfig.provider = provider
+  }
+
+  const token = readString(source['token'])
+  if (token) {
+    parsedConfig.token = token
+  }
+
+  const zoneId = readString(source['zoneId'])
+  if (zoneId) {
+    parsedConfig.zoneId = zoneId
+  }
+
+  const projectId = readString(source['projectId'])
+  if (projectId) {
+    parsedConfig.projectId = projectId
+  }
+
+  return parsedConfig
+}
+
+function toDbEnvironment(environment: DeployEnvironmentName): 'PREVIEW' | 'STAGING' | 'PRODUCTION' {
+  if (environment === 'preview') return 'PREVIEW'
+  if (environment === 'staging') return 'STAGING'
+  return 'PRODUCTION'
+}
+
+function fromDbEnvironment(environment: string): DeployEnvironmentName {
+  if (environment === 'PREVIEW') return 'preview'
+  if (environment === 'STAGING') return 'staging'
+  return 'production'
+}
+
+function normalizeDeploymentUrl(url: string | undefined): string | undefined {
+  if (!url) return undefined
+  if (url.startsWith('http://') || url.startsWith('https://')) {
+    return url
+  }
+  return `https://${url}`
+}
+
+function isInTimeWindow(at: Date, window: TimeWindow): boolean {
+  const day = at.getUTCDay()
+  const hour = at.getUTCHours()
+  const dayMatches = !window.dayOfWeek || window.dayOfWeek.includes(day)
+  const hourMatches = hour >= window.startHour && hour < window.endHour
+  return dayMatches && hourMatches
+}
+
+function normalizeTimeWindows(windows: TimeWindow[]): TimeWindow[] {
+  const deduped = new Map<string, TimeWindow>()
+  for (const window of windows) {
+    const key = JSON.stringify({
+      dayOfWeek: window.dayOfWeek ?? null,
+      startHour: window.startHour,
+      endHour: window.endHour,
+    })
+    deduped.set(key, window)
+  }
+  return Array.from(deduped.values())
+}
+
+function roundCurrency(value: number): number {
+  return Math.round(value * 100) / 100
+}
+
+function formatUsd(value: number): string {
+  return `$${roundCurrency(value).toFixed(2)}`
+}
+
+function emptyProviderCosts(): ProviderCostBreakdown {
+  return {
+    vercel: 0,
+    railway: 0,
+    fly: 0,
+  }
+}
+
+/** Singleton DevOps agent instance used by the orchestrator workers. */
 export const devOpsAgent = new DevOpsAgent()
