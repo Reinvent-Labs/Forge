@@ -1,17 +1,41 @@
 "use client"
 
-import { useState, useCallback } from "react"
-import { CheckSquare, History, Bell } from "lucide-react"
+import { useState, useCallback, useEffect } from "react"
+import { CheckSquare, History, Bell, Loader2 } from "lucide-react"
 import { ApprovalCard } from "@/components/ui/approval-card"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent } from "@/components/ui/card"
-import { MOCK_APPROVALS } from "@/lib/mock-data"
+import { fetchApprovals, approveRequest, rejectRequest } from "@/lib/api"
+import { useApprovalEvents } from "@/hooks/use-websocket"
 import { formatTimeAgo, getAgentLabel } from "@/lib/utils"
 import type { Approval } from "@/lib/types"
 
+const CURRENT_PROJECT_ID = "project-1"
+
 export default function ApprovalsPage() {
   const [tab, setTab] = useState<"pending" | "history">("pending")
-  const [approvals, setApprovals] = useState<Approval[]>(MOCK_APPROVALS)
+  const [approvals, setApprovals] = useState<Approval[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  const { pendingApprovals: wsPendingCount } = useApprovalEvents(CURRENT_PROJECT_ID)
+
+  useEffect(() => {
+    loadApprovals()
+  }, [])
+
+  const loadApprovals = async () => {
+    try {
+      setLoading(true)
+      setError(null)
+      const data = await fetchApprovals(CURRENT_PROJECT_ID)
+      setApprovals(data.approvals)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load approvals")
+    } finally {
+      setLoading(false)
+    }
+  }
 
   const pending = approvals
     .filter((a) => a.status === "pending")
@@ -22,18 +46,51 @@ export default function ApprovalsPage() {
     .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
 
   const handleApprove = useCallback(async (id: string) => {
-    setApprovals((prev) =>
-      prev.map((a) => a.id === id ? { ...a, status: "approved" as const, resolvedAt: new Date().toISOString() } : a)
-    )
-    await new Promise((resolve) => setTimeout(resolve, 600))
+    try {
+      await approveRequest(CURRENT_PROJECT_ID, id)
+      setApprovals((prev) =>
+        prev.map((a) => a.id === id ? { ...a, status: "approved" as const, resolvedAt: new Date().toISOString() } : a)
+      )
+    } catch (err) {
+      console.error("Failed to approve:", err)
+      throw err
+    }
   }, [])
 
   const handleReject = useCallback(async (id: string) => {
-    setApprovals((prev) =>
-      prev.map((a) => a.id === id ? { ...a, status: "rejected" as const, resolvedAt: new Date().toISOString() } : a)
-    )
-    await new Promise((resolve) => setTimeout(resolve, 600))
+    try {
+      await rejectRequest(CURRENT_PROJECT_ID, id, "Rejected by user")
+      setApprovals((prev) =>
+        prev.map((a) => a.id === id ? { ...a, status: "rejected" as const, resolvedAt: new Date().toISOString() } : a)
+      )
+    } catch (err) {
+      console.error("Failed to reject:", err)
+      throw err
+    }
   }, [])
+
+  if (loading) {
+    return (
+      <div className="flex flex-col items-center justify-center py-20">
+        <Loader2 className="h-8 w-8 text-green-500 animate-spin mb-4" />
+        <p className="text-zinc-400">Loading approvals...</p>
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center py-20">
+        <p className="text-red-400 mb-4">{error}</p>
+        <button
+          onClick={loadApprovals}
+          className="px-4 py-2 bg-zinc-800 text-zinc-200 rounded-lg hover:bg-zinc-700"
+        >
+          Retry
+        </button>
+      </div>
+    )
+  }
 
   return (
     <div className="space-y-6 max-w-4xl mx-auto">
@@ -44,10 +101,10 @@ export default function ApprovalsPage() {
             Forge needs your sign-off before making these changes to your product.
           </p>
         </div>
-        {pending.length > 0 && (
+        {(pending.length > 0 || wsPendingCount > 0) && (
           <Badge variant="danger" className="text-sm px-3 py-1.5">
             <Bell className="h-4 w-4" />
-            {pending.length} pending
+            {wsPendingCount > 0 ? wsPendingCount : pending.length} pending
           </Badge>
         )}
       </div>

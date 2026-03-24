@@ -1,624 +1,404 @@
-/**
- * @forge/agent-watcher — Unit Tests
- *
- * Tests the WatcherAgent's Welford online algorithm implementation,
- * anomaly sigma thresholds, batch classification chunking, deployment-
- * correlated spike detection, and silent failure detection.
- *
- * All external dependencies (prisma, ioredis, Anthropic) are fully mocked
- * so these tests run without any network or database access.
- */
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { AgentTask } from '@forge/shared'
 
-import { describe, it, expect, vi, beforeEach, type MockInstance } from 'vitest'
-
-// ---------------------------------------------------------------------------
-// Module mocks — must be hoisted before any imports that use them
-// ---------------------------------------------------------------------------
+const testMocks = vi.hoisted(() => ({
+  projectIntegrationFindMany: vi.fn(),
+  projectMetricsCreate: vi.fn(),
+  auditLogCreate: vi.fn(),
+  incidentCreate: vi.fn(),
+  agentTaskCreate: vi.fn(),
+  anthropicCreate: vi.fn(),
+}))
 
 vi.mock('@forge/database', () => ({
   prisma: {
+    projectIntegration: {
+      findMany: testMocks.projectIntegrationFindMany,
+    },
     projectMetricsSnapshot: {
-      findMany: vi.fn(),
-      create: vi.fn(),
-      findFirst: vi.fn(),
+      create: testMocks.projectMetricsCreate,
     },
-    codebaseContext: {
-      findFirst: vi.fn(),
-    },
-    deployment: {
-      findFirst: vi.fn(),
-    },
-    agentTask: {
-      create: vi.fn(),
+    auditLog: {
+      create: testMocks.auditLogCreate,
     },
     incident: {
-      count: vi.fn(),
-      findFirst: vi.fn(),
+      create: testMocks.incidentCreate,
+    },
+    agentTask: {
+      create: testMocks.agentTaskCreate,
     },
   },
 }))
 
-vi.mock('@anthropic-ai/sdk', () => {
-  const MockAnthropic = vi.fn().mockImplementation(() => ({
+vi.mock('@anthropic-ai/sdk', () => ({
+  default: vi.fn().mockImplementation(() => ({
     messages: {
-      create: vi.fn().mockResolvedValue({
-        content: [{ type: 'text', text: '["warning"]' }],
-      }),
+      create: testMocks.anthropicCreate,
     },
-  }))
-  return { default: MockAnthropic }
-})
-
-vi.mock('@forge/shared', () => ({
-  createLogger: () => ({
-    info: vi.fn(),
-    debug: vi.fn(),
-    warn: vi.fn(),
-    error: vi.fn(),
-    child: () => ({
-      info: vi.fn(),
-      debug: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-    }),
-  }),
-  normalizeErrorFingerprint: (msg: string) => msg.toLowerCase().replace(/\s+/g, '-').slice(0, 64),
+  })),
 }))
 
-// ---------------------------------------------------------------------------
-// Import subject under test after mocks are registered
-// ---------------------------------------------------------------------------
-
-import { WatcherAgent } from './index'
-import { prisma } from '@forge/database'
-
-// ---------------------------------------------------------------------------
-// Redis mock factory
-// ---------------------------------------------------------------------------
-
-/**
- * Creates a fresh in-memory Redis stub that supports the subset of commands
- * used by WatcherAgent: pipeline, zadd, zremrangebyscore, zscore, expire,
- * get, set, zrangebyscore.
- */
-function makeRedisMock() {
-  // Simulated sorted-set and key-value stores
-  const zsets: Record<string, Map<string, number>> = {}
-  const kvStore: Record<string, string> = {}
-
-  const redisMock = {
-    zadd: vi.fn((key: string, score: number, member: string) => {
-      if (!zsets[key]) zsets[key] = new Map()
-      zsets[key]!.set(member, score)
-      return Promise.resolve(1)
-    }),
-    zremrangebyscore: vi.fn((key: string, min: number | string, max: number | string) => {
-      if (!zsets[key]) return Promise.resolve(0)
-      const minNum = min === '-inf' ? -Infinity : Number(min)
-      const maxNum = max === '+inf' ? Infinity : Number(max)
-      let removed = 0
-      for (const [member, score] of zsets[key]!) {
-        if (score >= minNum && score <= maxNum) {
-          zsets[key]!.delete(member)
-          removed++
-        }
-      }
-      return Promise.resolve(removed)
-    }),
-    zscore: vi.fn((key: string, member: string) => {
-      const score = zsets[key]?.get(member)
-      return Promise.resolve(score !== undefined ? String(score) : null)
-    }),
-    zrangebyscore: vi.fn((key: string, min: number | string, max: number | string) => {
-      if (!zsets[key]) return Promise.resolve([])
-      const minNum = min === '-inf' ? -Infinity : Number(min)
-      const maxNum = max === '+inf' ? Infinity : Number(max)
-      const results: string[] = []
-      for (const [member, score] of zsets[key]!) {
-        if (score >= minNum && score <= maxNum) results.push(member)
-      }
-      return Promise.resolve(results)
-    }),
-    expire: vi.fn().mockResolvedValue(1),
-    get: vi.fn((key: string) => Promise.resolve(kvStore[key] ?? null)),
-    set: vi.fn((key: string, value: string) => {
-      kvStore[key] = value
-      return Promise.resolve('OK')
-    }),
-    pipeline: vi.fn(),
-    // Expose internal stores for test introspection
-    _zsets: zsets,
-    _kvStore: kvStore,
+vi.mock('@forge/shared', () => {
+  const logger = {
+    info: vi.fn(),
+    warn: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+    child: vi.fn(),
   }
+  logger.child.mockReturnValue(logger)
 
-  // The pipeline returns a chainable object whose exec() resolves with
-  // [error, result] pairs, mirroring ioredis semantics.
-  const pipelineMock = {
-    zremrangebyscore: vi.fn().mockReturnThis(),
-    zscore: vi.fn().mockReturnThis(),
-    exec: vi.fn().mockResolvedValue([
-      [null, 0],   // zremrangebyscore result
-      [null, null], // zscore result — null means "not found" (not a duplicate)
-    ]),
+  return {
+    createLogger: () => logger,
+    normalizeErrorFingerprint: (input: string) => input.toLowerCase().replace(/\s+/g, ' ').trim(),
   }
-  redisMock.pipeline.mockReturnValue(pipelineMock)
+})
 
-  return { redisMock, pipelineMock, zsets, kvStore }
+import WatcherAgent from './index'
+
+function createJsonResponse(body: unknown, status = 200, headers?: Record<string, string>): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      'content-type': 'application/json',
+      ...(headers ?? {}),
+    },
+  })
 }
 
-// ---------------------------------------------------------------------------
-// Welford algorithm helpers — replicated for ground-truth comparison
-// ---------------------------------------------------------------------------
+function createRedisMock() {
+  const state = new Map<string, string>()
 
-/**
- * Pure implementation of the Welford online mean/variance algorithm,
- * used as ground truth to verify the agent's Redis-backed implementation.
- */
-function welfordCompute(values: number[]): { mean: number; stdDev: number } {
-  if (values.length === 0) return { mean: 0, stdDev: 0 }
-  let n = 0
-  let mean = 0
-  let m2 = 0
-  for (const x of values) {
-    n++
-    const delta = x - mean
-    mean += delta / n
-    const delta2 = x - mean
-    m2 += delta * delta2
+  return {
+    state,
+    client: {
+      get: vi.fn(async (key: string) => state.get(key) ?? null),
+      set: vi.fn(async (key: string, value: string, ..._rest: Array<string | number>) => {
+        state.set(key, value)
+        return 'OK'
+      }),
+    },
   }
-  const variance = n > 1 ? m2 / (n - 1) : 0
-  return { mean, stdDev: Math.sqrt(variance) }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+function createTask(overrides: Partial<AgentTask> = {}): AgentTask {
+  return {
+    id: '3b77595f-7f5c-418a-bec5-8d8e2c247b17',
+    type: 'analyze_logs',
+    priority: 'high',
+    projectId: 'c3f81148-89fd-4e89-9f04-1d5dc1cb4652',
+    organizationId: '60b03439-cf63-4ff6-9ea5-1f7e10ee5277',
+    payload: {},
+    requestedBy: 'system',
+    autonomyLevel: 'semi',
+    createdAt: new Date('2026-01-01T00:00:00.000Z'),
+    ...overrides,
+  } as AgentTask
+}
+
+function baselineKey(projectId: string, metric: 'error_rate' | 'latency_p95' | 'latency_p99'): string {
+  return `forge:watcher:baseline:${projectId}:${metric}`
+}
+
+function seedBaseline(
+  state: Map<string, string>,
+  projectId: string,
+  metric: 'error_rate' | 'latency_p95' | 'latency_p99',
+  mean: number,
+  stdDev: number,
+  sampleCount: number,
+) {
+  const m2 = stdDev * stdDev * Math.max(sampleCount - 1, 0)
+  state.set(
+    baselineKey(projectId, metric),
+    JSON.stringify({
+      mean,
+      stdDev,
+      sampleCount,
+      m2,
+      updatedAt: new Date('2026-01-01T00:00:00.000Z').toISOString(),
+    }),
+  )
+}
 
 describe('WatcherAgent', () => {
-  let agent: WatcherAgent
-  let redisMock: ReturnType<typeof makeRedisMock>['redisMock']
-  let pipelineMock: ReturnType<typeof makeRedisMock>['pipelineMock']
-  let kvStore: ReturnType<typeof makeRedisMock>['kvStore']
-
   beforeEach(() => {
     vi.clearAllMocks()
-    const mocks = makeRedisMock()
-    redisMock = mocks.redisMock
-    pipelineMock = mocks.pipelineMock
-    kvStore = mocks.kvStore
-    // WatcherAgent accepts any Redis-compatible object
-    agent = new WatcherAgent(redisMock as never)
+
+    testMocks.projectIntegrationFindMany.mockResolvedValue([])
+    testMocks.projectMetricsCreate.mockResolvedValue({ id: 'snapshot-1' })
+    testMocks.auditLogCreate.mockResolvedValue({ id: 'audit-1' })
+    testMocks.incidentCreate.mockResolvedValue({ id: 'incident-1' })
+    testMocks.agentTaskCreate.mockResolvedValue({ id: 'task-1' })
+    testMocks.anthropicCreate.mockResolvedValue({ content: [{ type: 'text', text: '[]' }] })
   })
 
-  // -------------------------------------------------------------------------
-  // Welford online algorithm — convergence
-  // -------------------------------------------------------------------------
+  it('fetches logs from Vercel, Railway, and Fly and normalizes them', async () => {
+    const now = new Date('2026-01-01T12:00:00.000Z')
+    const fetchMock = vi.fn(async (input: string | URL) => {
+      const url = String(input)
 
-  describe('Welford online algorithm (updateRollingStats / getRollingStats)', () => {
-    it('converges mean to the arithmetic mean after N samples', async () => {
-      const values = [10, 20, 30, 40, 50]
-      const { mean: expectedMean } = welfordCompute(values)
-
-      // Feed all values into the agent's internal updateRollingStats.
-      // We drive this indirectly via detectAnomalies which calls the method
-      // after checking snapshots. Instead we access the private method
-      // through the agent's public surface by calling detectAnomalies
-      // with mocked snapshots that each carry the metric values.
-
-      // Seed the kvStore with a stats object after manually running Welford
-      // so we can verify getRollingStats reads it correctly.
-      const projectId = 'proj-welford-mean'
-      const metric = 'error_rate'
-      const key = `forge:baseline:${projectId}:${metric}`
-
-      // Simulate having previously processed the first 4 values
-      let n = 0, runningMean = 0, m2 = 0
-      for (const v of values.slice(0, 4)) {
-        n++
-        const delta = v - runningMean
-        runningMean += delta / n
-        const delta2 = v - runningMean
-        m2 += delta * delta2
+      if (url.includes('api.vercel.com')) {
+        return createJsonResponse({
+          logs: [
+            {
+              id: 'vercel-1',
+              timestamp: now.toISOString(),
+              level: 'info',
+              message: 'GET /health status=200 25ms',
+            },
+          ],
+        })
       }
-      const stdDevSoFar = n > 1 ? Math.sqrt(m2 / (n - 1)) : 0
-      kvStore[key] = JSON.stringify({
-        mean: runningMean,
-        stdDev: stdDevSoFar,
-        sampleCount: n,
-        updatedAt: Date.now(),
-      })
 
-      // Trigger updateRollingStats for the 5th value via detectAnomalies.
-      // detectAnomalies calls updateRollingStats when sampleCount < 10.
-      const fifthValue = values[4]!
-      vi.mocked(prisma.projectMetricsSnapshot.findMany).mockResolvedValue([
-        { id: '1', capturedAt: new Date(), projectId, errorRate: fifthValue, p95Latency: null, p99Latency: null } as never,
-      ])
-      vi.mocked(prisma.incident.count).mockResolvedValue(0)
-      vi.mocked(prisma.deployment.findFirst).mockResolvedValue(null)
-
-      await agent.detectAnomalies(projectId)
-
-      // The set call should have persisted updated stats
-      expect(redisMock.set).toHaveBeenCalled()
-      const setCall = vi.mocked(redisMock.set).mock.calls[0]!
-      const persisted = JSON.parse(setCall[1] as string) as { mean: number; stdDev: number; sampleCount: number }
-
-      expect(persisted.sampleCount).toBe(5)
-      expect(persisted.mean).toBeCloseTo(expectedMean, 8)
-    })
-
-    it('converges standard deviation to the population stddev after N samples', async () => {
-      const values = [2, 4, 4, 4, 5, 5, 7, 9]
-      const { mean: expectedMean, stdDev: expectedStdDev } = welfordCompute(values)
-
-      // Run Welford manually to get intermediate state after 7 values
-      let n = 0, runningMean = 0, m2 = 0
-      for (const v of values.slice(0, 7)) {
-        n++
-        const delta = v - runningMean
-        runningMean += delta / n
-        const delta2 = v - runningMean
-        m2 += delta * delta2
+      if (url.includes('railway.app')) {
+        return createJsonResponse({
+          data: {
+            project: {
+              logs: [
+                {
+                  id: 'railway-1',
+                  timestamp: now.toISOString(),
+                  severity: 'info',
+                  message: 'Worker heartbeat ok',
+                },
+              ],
+            },
+          },
+        })
       }
-      const projectId = 'proj-welford-std'
-      const metric = 'error_rate'
-      const key = `forge:baseline:${projectId}:${metric}`
-      kvStore[key] = JSON.stringify({
-        mean: runningMean,
-        stdDev: n > 1 ? Math.sqrt(m2 / (n - 1)) : 0,
-        sampleCount: n,
-        updatedAt: Date.now(),
-      })
 
-      vi.mocked(prisma.projectMetricsSnapshot.findMany).mockResolvedValue([
-        { id: '1', capturedAt: new Date(), projectId, errorRate: values[7]!, p95Latency: null, p99Latency: null } as never,
-      ])
-      vi.mocked(prisma.incident.count).mockResolvedValue(0)
-      vi.mocked(prisma.deployment.findFirst).mockResolvedValue(null)
-
-      await agent.detectAnomalies(projectId)
-
-      const setCall = vi.mocked(redisMock.set).mock.calls[0]!
-      const persisted = JSON.parse(setCall[1] as string) as { mean: number; stdDev: number }
-
-      expect(persisted.mean).toBeCloseTo(expectedMean, 8)
-      expect(persisted.stdDev).toBeCloseTo(expectedStdDev, 8)
-    })
-
-    it('initialises with mean = first value and stdDev = 0 for a single sample', async () => {
-      const projectId = 'proj-welford-init'
-      // No existing key in kvStore — agent should initialise from scratch
-      vi.mocked(prisma.projectMetricsSnapshot.findMany).mockResolvedValue([
-        { id: '1', capturedAt: new Date(), projectId, errorRate: 42, p95Latency: null, p99Latency: null } as never,
-      ])
-      vi.mocked(prisma.incident.count).mockResolvedValue(0)
-      vi.mocked(prisma.deployment.findFirst).mockResolvedValue(null)
-
-      await agent.detectAnomalies(projectId)
-
-      const setCall = vi.mocked(redisMock.set).mock.calls[0]!
-      const persisted = JSON.parse(setCall[1] as string) as { mean: number; stdDev: number; sampleCount: number }
-
-      expect(persisted.mean).toBe(42)
-      expect(persisted.stdDev).toBe(0)
-      expect(persisted.sampleCount).toBe(1)
-    })
-  })
-
-  // -------------------------------------------------------------------------
-  // Sigma threshold — anomaly detection
-  // -------------------------------------------------------------------------
-
-  describe('anomaly sigma threshold (ANOMALY_SIGMA_THRESHOLD = 2.5)', () => {
-    /**
-     * Helper: seeds Redis with rolling stats and calls detectAnomalies with a
-     * given current error-rate value. Returns the AnomalyReport.
-     */
-    async function runWithStats(
-      projectId: string,
-      mean: number,
-      stdDev: number,
-      sampleCount: number,
-      currentValue: number,
-    ) {
-      const key = `forge:baseline:${projectId}:error_rate`
-      kvStore[key] = JSON.stringify({ mean, stdDev, sampleCount, updatedAt: Date.now() })
-
-      vi.mocked(prisma.projectMetricsSnapshot.findMany).mockResolvedValue([
-        { id: '1', capturedAt: new Date(), projectId, errorRate: currentValue, p95Latency: null, p99Latency: null } as never,
-      ])
-      vi.mocked(prisma.incident.count).mockResolvedValue(0)
-      vi.mocked(prisma.deployment.findFirst).mockResolvedValue(null)
-
-      return agent.detectAnomalies(projectId)
-    }
-
-    it('does NOT flag a value at exactly 2.5σ as an anomaly (strict less-than check)', async () => {
-      // The threshold is >= 2.5, so a value at exactly 2.499σ should not trigger
-      const mean = 100
-      const stdDev = 10
-      const currentValue = mean + 2.499 * stdDev // 124.99 — just below threshold
-      const report = await runWithStats('proj-sigma-below', mean, stdDev, 15, currentValue)
-      expect(report.anomalies.filter((a) => a.metric === 'error_rate')).toHaveLength(0)
-    })
-
-    it('flags a value at exactly 2.5σ as an anomaly', async () => {
-      const mean = 100
-      const stdDev = 10
-      const currentValue = mean + 2.5 * stdDev // 125 — at threshold
-      const report = await runWithStats('proj-sigma-at', mean, stdDev, 15, currentValue)
-      const errAnomalies = report.anomalies.filter((a) => a.metric === 'error_rate')
-      expect(errAnomalies).toHaveLength(1)
-      expect(errAnomalies[0]!.sigmas).toBeCloseTo(2.5, 5)
-    })
-
-    it('flags a value at 3σ as an anomaly with correct sigmas', async () => {
-      const mean = 50
-      const stdDev = 5
-      const currentValue = mean + 3 * stdDev // 65
-      const report = await runWithStats('proj-sigma-3', mean, stdDev, 15, currentValue)
-      const errAnomalies = report.anomalies.filter((a) => a.metric === 'error_rate')
-      expect(errAnomalies).toHaveLength(1)
-      expect(errAnomalies[0]!.sigmas).toBeCloseTo(3, 5)
-      expect(errAnomalies[0]!.rollingMean).toBe(mean)
-      expect(errAnomalies[0]!.stdDev).toBe(stdDev)
-    })
-
-    it('skips anomaly detection when sampleCount < 10 (baseline still warming up)', async () => {
-      const mean = 100
-      const stdDev = 10
-      const currentValue = mean + 5 * stdDev // 5σ — would trigger if baseline were ready
-      const report = await runWithStats('proj-sigma-warmup', mean, stdDev, 9, currentValue)
-      // With sampleCount < 10 the agent only calls updateRollingStats, not the sigma check
-      expect(report.anomalies.filter((a) => a.metric === 'error_rate')).toHaveLength(0)
-    })
-
-    it('returns zero anomalies when no recent snapshots exist', async () => {
-      vi.mocked(prisma.projectMetricsSnapshot.findMany).mockResolvedValue([])
-      const report = await agent.detectAnomalies('proj-no-snapshots')
-      expect(report.anomalies).toHaveLength(0)
-      expect(report.deploymentCorrelated).toBe(false)
-    })
-  })
-
-  // -------------------------------------------------------------------------
-  // Batch classification chunking
-  // -------------------------------------------------------------------------
-
-  describe('classifyViaClaude chunking (chunks of 20)', () => {
-    it('sends exactly 2 chunks for 25 events (ceil(25/20) = 2)', async () => {
-      // processLogBatch drives classifyViaClaude → classifyChunk
-      // Each classifyChunk call invokes this.anthropic.messages.create once.
-      // We obtain the mock from the Anthropic constructor.
-      const Anthropic = (await import('@anthropic-ai/sdk')).default
-      const anthropicInstance = vi.mocked(Anthropic).mock.results[0]!.value as {
-        messages: { create: MockInstance }
+      if (url.includes('api.fly.io')) {
+        return createJsonResponse({
+          data: {
+            app: {
+              logs: {
+                nodes: [
+                  {
+                    id: 'fly-1',
+                    timestamp: now.toISOString(),
+                    level: 'info',
+                    message: 'Request served in 41ms',
+                  },
+                ],
+              },
+            },
+          },
+        })
       }
-      const createSpy = anthropicInstance.messages.create
 
-      // Return a valid classification array for each chunk
-      createSpy.mockImplementation(({ messages }: { messages: Array<{ content: string }> }) => {
-        const content = messages[0]!.content as string
-        // Count how many lines are in the event list section
-        const lineCount = (content.match(/^\d+\./gm) ?? []).length || 20
-        const arr = Array.from({ length: lineCount }, () => 'noise')
-        return Promise.resolve({ content: [{ type: 'text', text: JSON.stringify(arr) }] })
-      })
-
-      const makeEvent = (i: number) => ({
-        id: `evt-${i}`,
-        projectId: 'proj-chunk',
-        source: 'sentry',
-        timestamp: new Date(),
-        level: 'error',
-        message: `Error message ${i}`,
-        metadata: {},
-      })
-
-      const events = Array.from({ length: 25 }, (_, i) => makeEvent(i))
-
-      // Pipeline mock: all events are treated as new (zscore returns null)
-      pipelineMock.exec.mockResolvedValue([
-        [null, 0],
-        [null, null],
-      ])
-
-      vi.mocked(prisma.codebaseContext.findFirst).mockResolvedValue(null)
-      vi.mocked(prisma.deployment.findFirst).mockResolvedValue(null)
-      vi.mocked(prisma.agentTask.create).mockResolvedValue({ id: 'task-1' } as never)
-
-      await agent.processLogBatch(events)
-
-      // classifyChunk should have been called twice (chunk 1: 20, chunk 2: 5)
-      expect(createSpy).toHaveBeenCalledTimes(2)
+      return createJsonResponse({}, 404)
     })
 
-    it('sends exactly 1 chunk for 20 events', async () => {
-      const Anthropic = (await import('@anthropic-ai/sdk')).default
-      const anthropicInstance = vi.mocked(Anthropic).mock.results[0]!.value as {
-        messages: { create: MockInstance }
-      }
-      const createSpy = anthropicInstance.messages.create
+    const { client: redisClient } = createRedisMock()
+    const eventBus = { publishEvent: vi.fn().mockResolvedValue(undefined) }
 
-      createSpy.mockResolvedValue({
-        content: [{ type: 'text', text: JSON.stringify(Array(20).fill('noise')) }],
-      })
-
-      const events = Array.from({ length: 20 }, (_, i) => ({
-        id: `evt-${i}`,
-        projectId: 'proj-chunk20',
-        source: 'sentry',
-        timestamp: new Date(),
-        level: 'error',
-        message: `Error ${i}`,
-        metadata: {},
-      }))
-
-      pipelineMock.exec.mockResolvedValue([[null, 0], [null, null]])
-      vi.mocked(prisma.codebaseContext.findFirst).mockResolvedValue(null)
-      vi.mocked(prisma.deployment.findFirst).mockResolvedValue(null)
-
-      await agent.processLogBatch(events)
-
-      expect(createSpy).toHaveBeenCalledTimes(1)
+    const agent = new WatcherAgent({
+      redis: redisClient as never,
+      eventBus,
+      fetchImplementation: fetchMock as unknown as typeof fetch,
+      now: () => now,
+      config: { minBaselineSamples: 999 },
     })
+
+    const result = await agent.handleTask(
+      createTask({
+        payload: {
+          retentionWindowMinutes: 30,
+          sources: [
+            { provider: 'vercel', token: 'token-v', projectId: 'vercel-project' },
+            { provider: 'railway', token: 'token-r', projectId: 'railway-project' },
+            { provider: 'fly', token: 'token-f', appName: 'fly-app' },
+          ],
+        },
+      }),
+    )
+
+    expect(result.success).toBe(true)
+    expect(result.sourcesChecked).toEqual(['vercel', 'railway', 'fly'])
+    expect(result.logsFetched).toBe(3)
+    expect(result.normalizedLogs).toBe(3)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
   })
 
-  // -------------------------------------------------------------------------
-  // Deployment-correlated spike detection
-  // -------------------------------------------------------------------------
+  it('detects anomaly spikes, stores alert history, emits events, and triggers Fixer for critical alerts', async () => {
+    const now = new Date('2026-01-01T12:00:00.000Z')
+    const { client: redisClient, state } = createRedisMock()
+    const eventBus = { publishEvent: vi.fn().mockResolvedValue(undefined) }
 
-  describe('deployment-correlated spike detection (10-min window)', () => {
-    it('marks report as deploymentCorrelated when a deploy occurred within 10 minutes and error_rate spiked', async () => {
-      const projectId = 'proj-deploy-corr'
-      const mean = 1
-      const stdDev = 0.1
-      // 4σ spike — well above threshold
-      const currentValue = mean + 4 * stdDev
+    const projectId = 'c3f81148-89fd-4e89-9f04-1d5dc1cb4652'
+    seedBaseline(state, projectId, 'error_rate', 0.02, 0.01, 30)
+    seedBaseline(state, projectId, 'latency_p95', 200, 30, 30)
+    seedBaseline(state, projectId, 'latency_p99', 300, 40, 30)
 
-      const key = `forge:baseline:${projectId}:error_rate`
-      kvStore[key] = JSON.stringify({ mean, stdDev, sampleCount: 20, updatedAt: Date.now() })
+    const noisyLogs = Array.from({ length: 20 }, (_, index) => ({
+      id: `err-${index}`,
+      timestamp: now.toISOString(),
+      level: 'error',
+      message: `Unhandled exception in checkout flow status=500 ${1400 + index}ms`,
+      statusCode: 500,
+      latencyMs: 1400 + index,
+    }))
 
-      vi.mocked(prisma.projectMetricsSnapshot.findMany).mockResolvedValue([
-        { id: '1', capturedAt: new Date(), projectId, errorRate: currentValue, p95Latency: null, p99Latency: null } as never,
-      ])
-      vi.mocked(prisma.incident.count).mockResolvedValue(0)
+    const fetchMock = vi.fn(async () => createJsonResponse({ logs: noisyLogs }))
 
-      // Deploy completed 5 minutes ago — within the 10-min window
-      const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000)
-      vi.mocked(prisma.deployment.findFirst).mockResolvedValue({
-        id: 'deploy-abc',
-        completedAt: fiveMinutesAgo,
-        status: 'SUCCEEDED',
-      } as never)
-
-      const report = await agent.detectAnomalies(projectId)
-
-      expect(report.deploymentCorrelated).toBe(true)
-      expect(report.triggeringDeployId).toBe('deploy-abc')
+    const agent = new WatcherAgent({
+      redis: redisClient as never,
+      eventBus,
+      fetchImplementation: fetchMock as unknown as typeof fetch,
+      now: () => now,
     })
 
-    it('does NOT mark deploymentCorrelated when deploy was 15 minutes ago (outside window)', async () => {
-      const projectId = 'proj-deploy-old'
-      const mean = 1
-      const stdDev = 0.1
-      const currentValue = mean + 4 * stdDev
+    const result = await agent.handleTask(
+      createTask({
+        payload: {
+          retentionWindowMinutes: 30,
+          sources: [{ provider: 'vercel', token: 'token-v', projectId: 'vercel-project' }],
+        },
+      }),
+    )
 
-      const key = `forge:baseline:${projectId}:error_rate`
-      kvStore[key] = JSON.stringify({ mean, stdDev, sampleCount: 20, updatedAt: Date.now() })
-
-      vi.mocked(prisma.projectMetricsSnapshot.findMany).mockResolvedValue([
-        { id: '1', capturedAt: new Date(), projectId, errorRate: currentValue, p95Latency: null, p99Latency: null } as never,
-      ])
-      vi.mocked(prisma.incident.count).mockResolvedValue(0)
-
-      // detectDeploymentCorrelation queries the DB with `completedAt >= cutoff`.
-      // Returning null simulates no deployment within the window.
-      vi.mocked(prisma.deployment.findFirst).mockResolvedValue(null)
-
-      const report = await agent.detectAnomalies(projectId)
-
-      expect(report.deploymentCorrelated).toBe(false)
-      expect(report.triggeringDeployId).toBeUndefined()
-    })
-
-    it('does NOT mark deploymentCorrelated when there is a deploy but no error_rate spike', async () => {
-      const projectId = 'proj-deploy-no-spike'
-      const mean = 5
-      const stdDev = 1
-      // Only 1σ — well below the 2.5σ threshold
-      const currentValue = mean + 1 * stdDev
-
-      const key = `forge:baseline:${projectId}:error_rate`
-      kvStore[key] = JSON.stringify({ mean, stdDev, sampleCount: 20, updatedAt: Date.now() })
-
-      vi.mocked(prisma.projectMetricsSnapshot.findMany).mockResolvedValue([
-        { id: '1', capturedAt: new Date(), projectId, errorRate: currentValue, p95Latency: null, p99Latency: null } as never,
-      ])
-      vi.mocked(prisma.incident.count).mockResolvedValue(0)
-      vi.mocked(prisma.deployment.findFirst).mockResolvedValue({
-        id: 'deploy-xyz',
-        completedAt: new Date(Date.now() - 2 * 60 * 1000),
-        status: 'SUCCEEDED',
-      } as never)
-
-      const report = await agent.detectAnomalies(projectId)
-
-      expect(report.deploymentCorrelated).toBe(false)
-    })
+    expect(result.success).toBe(true)
+    expect(result.anomaliesDetected).toBeGreaterThan(0)
+    expect(result.criticalAlerts).toBeGreaterThan(0)
+    expect(testMocks.auditLogCreate).toHaveBeenCalled()
+    expect(eventBus.publishEvent).toHaveBeenCalled()
+    expect(testMocks.agentTaskCreate).toHaveBeenCalled()
   })
 
-  // -------------------------------------------------------------------------
-  // Silent failure detection
-  // -------------------------------------------------------------------------
+  it('retries provider calls on HTTP 429 and respects Retry-After delay', async () => {
+    const now = new Date('2026-01-01T12:00:00.000Z')
+    const { client: redisClient } = createRedisMock()
+    const sleepMock = vi.fn(async (_ms: number) => undefined)
 
-  describe('silent failure detection', () => {
-    it('adds a silent_failure anomaly when open incidents exist but error rate is < 0.01', async () => {
-      const projectId = 'proj-silent'
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(createJsonResponse({ message: 'rate limited' }, 429, { 'retry-after': '1' }))
+      .mockResolvedValueOnce(
+        createJsonResponse({
+          logs: [
+            {
+              id: 'v-1',
+              timestamp: now.toISOString(),
+              level: 'info',
+              message: 'Healthy request in 20ms',
+            },
+          ],
+        }),
+      )
 
-      // Snapshots exist but the error rate is near zero
-      vi.mocked(prisma.projectMetricsSnapshot.findMany).mockResolvedValue([
-        { id: '1', capturedAt: new Date(), projectId, errorRate: 0.001, p95Latency: null, p99Latency: null } as never,
-      ])
-      // No rolling stats — skip sigma check
-      vi.mocked(prisma.incident.count).mockResolvedValue(3)
-      vi.mocked(prisma.projectMetricsSnapshot.findFirst).mockResolvedValue({
-        id: '1', capturedAt: new Date(), projectId, errorRate: 0.001,
-      } as never)
-      vi.mocked(prisma.deployment.findFirst).mockResolvedValue(null)
-
-      const report = await agent.detectAnomalies(projectId)
-
-      const silentAnomalies = report.anomalies.filter((a) => a.metric === 'silent_failure')
-      expect(silentAnomalies).toHaveLength(1)
-      expect(silentAnomalies[0]!.sigmas).toBe(999)
-      expect(silentAnomalies[0]!.currentValue).toBe(3) // open incident count
+    const agent = new WatcherAgent({
+      redis: redisClient as never,
+      fetchImplementation: fetchMock as unknown as typeof fetch,
+      sleepImplementation: sleepMock,
+      now: () => now,
+      config: {
+        minBaselineSamples: 999,
+        rateLimit: {
+          maxRetries: 2,
+          baseDelayMs: 100,
+          maxDelayMs: 2000,
+        },
+      },
     })
 
-    it('does NOT add a silent_failure anomaly when there are no open incidents', async () => {
-      const projectId = 'proj-no-silent'
+    const result = await agent.handleTask(
+      createTask({
+        payload: {
+          retentionWindowMinutes: 30,
+          sources: [{ provider: 'vercel', token: 'token-v', projectId: 'vercel-project' }],
+        },
+      }),
+    )
 
-      vi.mocked(prisma.projectMetricsSnapshot.findMany).mockResolvedValue([
-        { id: '1', capturedAt: new Date(), projectId, errorRate: 0.001, p95Latency: null, p99Latency: null } as never,
-      ])
-      vi.mocked(prisma.incident.count).mockResolvedValue(0)
-      vi.mocked(prisma.projectMetricsSnapshot.findFirst).mockResolvedValue({
-        id: '1', capturedAt: new Date(), projectId, errorRate: 0.001,
-      } as never)
-      vi.mocked(prisma.deployment.findFirst).mockResolvedValue(null)
-
-      const report = await agent.detectAnomalies(projectId)
-
-      expect(report.anomalies.filter((a) => a.metric === 'silent_failure')).toHaveLength(0)
-    })
-
-    it('does NOT add a silent_failure anomaly when error rate is >= 0.01 (visible errors)', async () => {
-      const projectId = 'proj-high-err'
-
-      vi.mocked(prisma.projectMetricsSnapshot.findMany).mockResolvedValue([
-        { id: '1', capturedAt: new Date(), projectId, errorRate: 0.05, p95Latency: null, p99Latency: null } as never,
-      ])
-      vi.mocked(prisma.incident.count).mockResolvedValue(5)
-      vi.mocked(prisma.projectMetricsSnapshot.findFirst).mockResolvedValue({
-        id: '1', capturedAt: new Date(), projectId, errorRate: 0.05,
-      } as never)
-      vi.mocked(prisma.deployment.findFirst).mockResolvedValue(null)
-
-      const report = await agent.detectAnomalies(projectId)
-
-      expect(report.anomalies.filter((a) => a.metric === 'silent_failure')).toHaveLength(0)
-    })
+    expect(result.success).toBe(true)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(sleepMock).toHaveBeenCalledWith(1000)
   })
 
-  // -------------------------------------------------------------------------
-  // processLogBatch — empty batch guard
-  // -------------------------------------------------------------------------
+  it('honors retention window configuration when filtering logs', async () => {
+    const now = new Date('2026-01-01T12:00:00.000Z')
+    const oldTimestamp = new Date(now.getTime() - 30 * 60_000).toISOString()
+    const recentTimestamp = new Date(now.getTime() - 2 * 60_000).toISOString()
 
-  describe('processLogBatch edge cases', () => {
-    it('returns early without calling Redis when event array is empty', async () => {
-      await agent.processLogBatch([])
-      expect(redisMock.pipeline).not.toHaveBeenCalled()
+    const fetchMock = vi.fn(async () =>
+      createJsonResponse({
+        logs: [
+          { id: 'old', timestamp: oldTimestamp, level: 'info', message: 'Old log line' },
+          { id: 'new', timestamp: recentTimestamp, level: 'info', message: 'Recent log line' },
+        ],
+      }),
+    )
+
+    const { client: redisClient } = createRedisMock()
+
+    const agent = new WatcherAgent({
+      redis: redisClient as never,
+      fetchImplementation: fetchMock as unknown as typeof fetch,
+      now: () => now,
+      config: { minBaselineSamples: 999 },
     })
+
+    const result = await agent.handleTask(
+      createTask({
+        payload: {
+          retentionWindowMinutes: 5,
+          sources: [{ provider: 'vercel', token: 'token-v', projectId: 'vercel-project' }],
+        },
+      }),
+    )
+
+    expect(result.success).toBe(true)
+    expect(result.logsFetched).toBe(2)
+    expect(result.normalizedLogs).toBe(1)
+  })
+
+  it('classify_alert uses Anthropic output and triggers Fixer when severity is critical', async () => {
+    const now = new Date('2026-01-01T12:00:00.000Z')
+    const { client: redisClient } = createRedisMock()
+
+    testMocks.anthropicCreate.mockResolvedValueOnce({
+      content: [
+        {
+          type: 'text',
+          text: '{"severity":"critical","reason":"Payment failures indicate a user-facing outage"}',
+        },
+      ],
+    })
+
+    const eventBus = { publishEvent: vi.fn().mockResolvedValue(undefined) }
+    const fetchMock = vi.fn(async () => createJsonResponse({ logs: [] }))
+
+    const agent = new WatcherAgent({
+      redis: redisClient as never,
+      eventBus,
+      fetchImplementation: fetchMock as unknown as typeof fetch,
+      now: () => now,
+    })
+
+    const result = await agent.handleTask(
+      createTask({
+        type: 'classify_alert',
+        payload: {
+          provider: 'vercel',
+          log: {
+            id: 'entry-1',
+            timestamp: now.toISOString(),
+            level: 'info',
+            message: 'Checkout flow unavailable for most requests',
+          },
+        },
+      }),
+    )
+
+    expect(result.success).toBe(true)
+    expect(result.alerts).toHaveLength(1)
+    expect(result.alerts[0]?.severity).toBe('critical')
+    expect(testMocks.anthropicCreate).toHaveBeenCalled()
+    expect(testMocks.agentTaskCreate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ type: 'FIX_INCIDENT' }),
+      }),
+    )
   })
 })

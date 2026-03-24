@@ -62,6 +62,10 @@ export function decrypt(encryptedValue: string, keyHex: string): string {
   const tag = Buffer.from(tagB64, 'base64')
   const ciphertext = Buffer.from(ciphertextB64, 'base64')
 
+  if (tag.length !== TAG_LENGTH) {
+    throw new Error('Invalid auth tag length')
+  }
+
   const decipher = createDecipheriv(ALGORITHM, key, iv)
   decipher.setAuthTag(tag)
 

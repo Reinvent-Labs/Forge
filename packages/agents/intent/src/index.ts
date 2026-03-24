@@ -1,679 +1,1148 @@
-/**
- * @forge/agent-intent
- *
- * The Intent Agent translates natural language messages from founders and
- * developers into structured AgentTasks or conversational responses. It uses
- * Claude Haiku for fast intent classification and entity extraction, and
- * Claude Sonnet for complex feature-complexity estimation. It also detects
- * approval tokens in inbound messages and routes them to the ApprovalGateway.
- */
-
 import Anthropic from '@anthropic-ai/sdk'
 import { createLogger } from '@forge/shared'
-import type {
-  AgentTask,
-  ParsedIntent,
-  IntentType,
-  ApprovalNotification,
-} from '@forge/shared'
-import { prisma } from '@forge/database'
-import { randomUUID } from 'crypto'
+import type { AgentTask, DeployEnvironment, TaskPriority } from '@forge/shared'
 
 const log = createLogger('agent-intent')
 
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
+const HAIKU_MODEL = 'claude-haiku-4-5-20251001'
+const DEFAULT_CONFIDENCE_THRESHOLD = 0.72
+const DEFAULT_MAX_THREAD_MESSAGES = 6
 
-/**
- * Structured response the Intent Agent sends back to the messaging channel.
- */
-export interface IntentResponse {
-  /** Confirmation of what the agent understood: "I understood you want to..." */
-  understood: string
-  /** What the agent is doing or why no action is taken: "I am going to..." */
-  action: string
-  /** Approximate timeline for completion, if applicable. */
-  timeline?: string
-  /** True when an approval is required before executing the action. */
-  needsApproval?: boolean
-  /** Full approval notification payload, present when needsApproval is true. */
-  approvalNotification?: ApprovalNotification
-  /** Clarification question shown to the user when confidence is low. */
+export type IntentType =
+  | 'build_feature'
+  | 'fix_bug'
+  | 'deploy'
+  | 'rollback'
+  | 'security_scan'
+  | 'debt_review'
+  | 'unknown'
+
+export type IntentSource = 'slack' | 'telegram'
+
+export interface ConversationTurn {
+  role: 'user' | 'assistant'
+  text: string
+  timestamp?: Date
+}
+
+export interface IntentMessageInput {
+  message: string
+  projectId: string
+  organizationId?: string
+  senderId: string
+  source?: IntentSource
+  languageHint?: string
+  threadId?: string
+  thread?: ConversationTurn[]
+  routeToOrchestrator?: boolean
+  requestedBy?: AgentTask['requestedBy']
+  autonomyLevel?: AgentTask['autonomyLevel']
+}
+
+export type LegacyParseOptions = Omit<
+  Partial<IntentMessageInput>,
+  'message' | 'projectId' | 'senderId'
+>
+
+export interface IntentEntities {
+  projectReferences: string[]
+  filePaths: string[]
+  description?: string
+  priority?: TaskPriority
+  environment?: DeployEnvironment
+  language: string
+}
+
+export interface IntentResult {
+  raw: string
+  source: IntentSource
+  type: IntentType
+  entities: IntentEntities
+  confidence: number
+  needsClarification: boolean
   clarificationQuestion?: string
-  /** ID of the AgentTask created for this intent, if any. */
-  generatedTaskId?: string
+  structuredTask?: Omit<AgentTask, 'id' | 'createdAt'>
+  routedTaskId?: string
+  routingError?: string
+}
+
+export interface IntentHandleTaskResult {
+  success: boolean
+  summary: string
+  result: IntentResult
+}
+
+export interface OrchestratorLike {
+  processTask(task: Omit<AgentTask, 'id' | 'createdAt'>): Promise<string>
+}
+
+export interface IntentAgentOptions {
+  anthropicClient?: Anthropic
+  orchestrator?: OrchestratorLike
+  anthropicApiKey?: string
+  model?: string
+  confidenceThreshold?: number
+  maxThreadMessages?: number
+}
+
+interface NormalizedInput {
+  message: string
+  projectId: string
+  organizationId: string
+  senderId: string
+  source: IntentSource
+  languageHint?: string
+  threadId?: string
+  thread: ConversationTurn[]
+  routeToOrchestrator: boolean
+  requestedBy: AgentTask['requestedBy']
+  autonomyLevel: AgentTask['autonomyLevel']
+}
+
+interface RegexExtraction {
+  projectReferences: string[]
+  filePaths: string[]
+  priority?: TaskPriority
+  environment?: DeployEnvironment
+  description?: string
+}
+
+interface AiClassification {
+  type: IntentType
+  confidence: number
+  description?: string
+  projectReferences: string[]
+  filePaths: string[]
+  priority?: TaskPriority
+  environment?: DeployEnvironment
+  language?: string
 }
 
 /**
- * Result of processing an approval or rejection token from a message.
- */
-export interface ApprovalAction {
-  /** Whether this was an approval or rejection. */
-  action: 'approve' | 'reject'
-  /** The raw token found in the message. */
-  token: string
-  /** The approval request ID resolved from the token. */
-  approvalId: string
-}
-
-// ---------------------------------------------------------------------------
-// IntentAgent
-// ---------------------------------------------------------------------------
-
-/**
- * Translates inbound natural language into structured AgentTasks.
+ * NLP intent parser for Slack and Telegram command messages.
  *
- * @example
- * const agent = new IntentAgent()
- * const parsed = await agent.parseMessage('The checkout page is broken', projectId, senderId)
- * const response = await agent.generateResponse(parsed, projectId)
+ * The parser uses a hybrid strategy:
+ * 1. Claude Haiku for semantic command understanding.
+ * 2. Regex extraction for deterministic entity capture.
+ * 3. Confidence scoring to decide if clarification is required.
+ * 4. Optional orchestrator routing for actionable commands.
  */
 export class IntentAgent {
   private readonly anthropic: Anthropic
-  /** Confidence threshold below which a clarification question is asked. */
-  private readonly CONFIDENCE_THRESHOLD = 0.7
+  private readonly orchestrator: OrchestratorLike | null
+  private readonly model: string
+  private readonly confidenceThreshold: number
+  private readonly maxThreadMessages: number
 
-  constructor() {
-    this.anthropic = new Anthropic()
-    log.info('IntentAgent initialized')
+  constructor(options: IntentAgentOptions = {}) {
+    this.anthropic =
+      options.anthropicClient ??
+      new Anthropic({
+        apiKey: options.anthropicApiKey ?? process.env['ANTHROPIC_API_KEY'] ?? 'missing-api-key',
+      })
+    this.orchestrator = options.orchestrator ?? null
+    this.model = options.model ?? HAIKU_MODEL
+    this.confidenceThreshold = options.confidenceThreshold ?? DEFAULT_CONFIDENCE_THRESHOLD
+    this.maxThreadMessages = options.maxThreadMessages ?? DEFAULT_MAX_THREAD_MESSAGES
+
+    log.info(
+      {
+        model: this.model,
+        confidenceThreshold: this.confidenceThreshold,
+        hasOrchestrator: this.orchestrator !== null,
+      },
+      'IntentAgent initialized',
+    )
   }
 
-  // -------------------------------------------------------------------------
-  // 1. parseMessage
-  // -------------------------------------------------------------------------
+  /**
+   * Worker entry point for `translate_intent` tasks.
+   *
+   * Expected payload fields:
+   * - `message`: natural language command
+   * - `source`: `slack` or `telegram`
+   * - `senderId`: sender identifier
+   * - `thread`: optional conversation thread context
+   */
+  async handleTask(task: AgentTask): Promise<IntentHandleTaskResult> {
+    if (task.type !== 'translate_intent') {
+      const fallback = this.buildUnknownResult({
+        message: 'Unsupported task type',
+        source: 'slack',
+      })
+      return {
+        success: false,
+        summary: `Intent agent only handles translate_intent tasks (received: ${task.type})`,
+        result: fallback,
+      }
+    }
+
+    const payload = task.payload
+    const message = typeof payload['message'] === 'string' ? payload['message'] : ''
+    if (!message.trim()) {
+      const fallback = this.buildUnknownResult({
+        message: 'Missing message content',
+        source: 'slack',
+      })
+      return {
+        success: false,
+        summary: 'translate_intent payload must include a non-empty message string',
+        result: fallback,
+      }
+    }
+
+    const source = normalizeSource(payload['source'])
+    const senderId =
+      typeof payload['senderId'] === 'string' && payload['senderId'].trim() !== ''
+        ? payload['senderId']
+        : 'system'
+    const languageHint =
+      typeof payload['languageHint'] === 'string' ? payload['languageHint'] : undefined
+    const threadId = typeof payload['threadId'] === 'string' ? payload['threadId'] : undefined
+    const thread = parseThread(payload['thread'])
+
+    const parseInput: IntentMessageInput = {
+      message,
+      projectId: task.projectId,
+      organizationId: task.organizationId,
+      senderId,
+      source,
+      thread,
+      requestedBy: task.requestedBy,
+      autonomyLevel: task.autonomyLevel,
+      routeToOrchestrator: true,
+    }
+    if (languageHint) {
+      parseInput.languageHint = languageHint
+    }
+    if (threadId) {
+      parseInput.threadId = threadId
+    }
+
+    const parsed = await this.parseMessage(parseInput)
+
+    const summary = parsed.needsClarification
+      ? `Clarification required: ${parsed.clarificationQuestion ?? 'missing details'}`
+      : parsed.routedTaskId
+        ? `Intent parsed and routed as task ${parsed.routedTaskId}`
+        : 'Intent parsed successfully'
+
+    return {
+      success: !parsed.needsClarification && !parsed.routingError,
+      summary,
+      result: parsed,
+    }
+  }
 
   /**
-   * Full intent parsing pipeline using Claude Haiku.
-   *
-   * Steps:
-   * 1. Identify sender role (founder / developer / unknown) from org members.
-   * 2. Classify intent type via Haiku.
-   * 3. Extract entities: affected feature, error message, urgency, environment.
-   * 4. Enrich context per intent type (fetch logs, check features, metrics).
-   * 5. Generate structured AgentTask or mark for conversational reply.
-   * 6. If confidence < 0.7, set clarification question instead of task.
-   *
-   * @param message   - Raw natural language message.
-   * @param projectId - Project scope for the message.
-   * @param senderId  - User ID of the sender (for role identification).
-   * @returns Fully parsed intent with optional generated task.
+   * Parse a natural language command, classify intent, extract entities,
+   * and optionally route to orchestrator.
    */
+  async parseMessage(input: IntentMessageInput): Promise<IntentResult>
   async parseMessage(
     message: string,
     projectId: string,
     senderId: string,
-  ): Promise<ParsedIntent> {
-    const taskLog = log.child({ projectId, senderId })
-    taskLog.info({ message }, 'Parsing message')
+    options?: LegacyParseOptions,
+  ): Promise<IntentResult>
+  async parseMessage(
+    inputOrMessage: IntentMessageInput | string,
+    projectId?: string,
+    senderId?: string,
+    options: LegacyParseOptions = {},
+  ): Promise<IntentResult> {
+    const input = this.normalizeInput(inputOrMessage, projectId, senderId, options)
+    const parseLog = log.child({
+      projectId: input.projectId,
+      source: input.source,
+      senderId: input.senderId,
+    })
 
-    try {
-      // Step 1: Identify sender role
-      const senderRole = await this.identifySenderRole(senderId, projectId)
-
-      // Step 2 + 3: Classify intent and extract entities via Haiku
-      const { intentType, confidence, entities } = await this.classifyIntent(
-        message,
-        senderRole,
-      )
-
-      taskLog.info({ intentType, confidence, senderRole }, 'Intent classified')
-
-      // Step 4: Context enrichment based on intent type
-      const enrichedContext = await this.enrichContext(intentType, entities, projectId)
-
-      // Step 5 + 6: Build ParsedIntent
-      const requiresClarification = confidence < this.CONFIDENCE_THRESHOLD
-      let generatedTask: Partial<AgentTask> | undefined
-
-      if (\!requiresClarification) {
-        generatedTask = await this.buildAgentTask(
-          intentType,
-          entities,
-          enrichedContext,
-          projectId,
-        )
-      }
-
-      const parsed: ParsedIntent = {
-        raw: message,
-        intentType,
-        confidence,
-        entities,
-        requiresClarification,
-        ...(requiresClarification
-          ? {
-              clarificationQuestion: this.buildClarificationQuestion(
-                intentType,
-                entities,
-              ),
-            }
-          : {}),
-        ...(generatedTask ? { generatedTask } : {}),
-      }
-
-      taskLog.info(
-        { intentType, requiresClarification, hasTask: \!\!generatedTask },
-        'Message parsed',
-      )
-
-      return parsed
-    } catch (err) {
-      taskLog.error({ err }, 'Failed to parse message')
-      // Return a safe fallback: mark as general_chat requiring clarification
+    const sanitizedMessage = this.sanitizeMessage(input.message)
+    if (!sanitizedMessage) {
       return {
-        raw: message,
-        intentType: 'general_chat',
-        confidence: 0,
-        entities: {},
-        requiresClarification: true,
-        clarificationQuestion: 'I had trouble understanding that. Could you rephrase?',
+        ...this.buildUnknownResult({ message: input.message, source: input.source }),
+        clarificationQuestion: 'Please share the command in plain text.',
       }
     }
+
+    parseLog.info({ message: sanitizedMessage }, 'Parsing intent message')
+
+    const regexExtraction = this.extractEntitiesByRegex(sanitizedMessage, input.thread)
+    const aiClassification = await this.classifyWithHaiku(sanitizedMessage, input)
+
+    const resolvedType = this.resolveIntentType(sanitizedMessage, aiClassification, input.thread)
+    const entities = this.mergeEntities({
+      type: resolvedType,
+      sanitizedMessage,
+      regexExtraction,
+      aiClassification,
+      input,
+    })
+
+    const confidence = this.computeConfidence({
+      type: resolvedType,
+      message: sanitizedMessage,
+      entities,
+      aiConfidence: aiClassification.confidence,
+      threadUsed: this.looksContextDependent(sanitizedMessage) && input.thread.length > 0,
+    })
+
+    let needsClarification = this.shouldAskClarification(resolvedType, confidence, entities)
+    let clarificationQuestion = needsClarification
+      ? this.buildClarificationQuestion(resolvedType, entities)
+      : undefined
+
+    let structuredTask = !needsClarification
+      ? this.buildStructuredTask(resolvedType, entities, input)
+      : undefined
+
+    if (!needsClarification && structuredTask === undefined) {
+      needsClarification = true
+      clarificationQuestion = this.buildClarificationQuestion(resolvedType, entities)
+    }
+
+    let routedTaskId: string | undefined
+    let routingError: string | undefined
+    if (
+      !needsClarification &&
+      structuredTask !== undefined &&
+      input.routeToOrchestrator &&
+      this.orchestrator !== null
+    ) {
+      try {
+        routedTaskId = await this.orchestrator.processTask(structuredTask)
+      } catch (err) {
+        routingError = err instanceof Error ? err.message : String(err)
+      }
+    }
+
+    const result: IntentResult = {
+      raw: sanitizedMessage,
+      source: input.source,
+      type: resolvedType,
+      entities,
+      confidence,
+      needsClarification,
+      ...(clarificationQuestion ? { clarificationQuestion } : {}),
+      ...(structuredTask ? { structuredTask } : {}),
+      ...(routedTaskId ? { routedTaskId } : {}),
+      ...(routingError ? { routingError } : {}),
+    }
+
+    parseLog.info(
+      {
+        type: result.type,
+        confidence: result.confidence,
+        needsClarification: result.needsClarification,
+        routed: result.routedTaskId !== undefined,
+      },
+      'Intent parse completed',
+    )
+
+    return result
   }
 
-  // -------------------------------------------------------------------------
-  // 2. generateResponse
-  // -------------------------------------------------------------------------
-
-  /**
-   * Format a human-readable response for a parsed intent.
-   *
-   * Response includes:
-   * - Confirmation of what was understood.
-   * - What action is being taken (or why no action is needed).
-   * - Expected timeline, if applicable.
-   * - Approval notification payload if an approval is required.
-   *
-   * @param parsed    - Output from parseMessage.
-   * @param projectId - Project scope.
-   * @returns Structured IntentResponse ready for delivery to the channel.
-   */
-  async generateResponse(
-    parsed: ParsedIntent,
-    projectId: string,
-  ): Promise<IntentResponse> {
-    const respLog = log.child({ projectId, intentType: parsed.intentType })
-    respLog.debug('Generating response')
-
-    try {
-      if (parsed.requiresClarification) {
-        return {
-          understood: 'I received your message but need some clarification.',
-          action: 'Please answer the question below so I can help you.',
-          clarificationQuestion: parsed.clarificationQuestion,
-        }
+  private normalizeInput(
+    inputOrMessage: IntentMessageInput | string,
+    projectId?: string,
+    senderId?: string,
+    options: LegacyParseOptions = {},
+  ): NormalizedInput {
+    if (typeof inputOrMessage === 'string') {
+      if (!projectId || !senderId) {
+        throw new Error('parseMessage(message, projectId, senderId) requires projectId and senderId')
       }
 
-      const understood = this.buildUnderstoodStatement(parsed)
-      const { action, timeline, needsApproval } = this.buildActionStatement(parsed)
-
-      const response: IntentResponse = {
-        understood,
-        action,
-        ...(timeline ? { timeline } : {}),
-        ...(parsed.generatedTask?.id ? { generatedTaskId: parsed.generatedTask.id as string } : {}),
-      }
-
-      if (needsApproval) {
-        const approval = await this.buildApprovalNotification(parsed, projectId)
-        response.needsApproval = true
-        response.approvalNotification = approval
-      }
-
-      respLog.info({ needsApproval }, 'Response generated')
-      return response
-    } catch (err) {
-      respLog.error({ err }, 'Failed to generate response')
       return {
-        understood: 'I received your message.',
-        action: 'I encountered an error processing your request. Please try again.',
+        message: inputOrMessage,
+        projectId,
+        organizationId: options.organizationId ?? projectId,
+        senderId,
+        source: options.source ?? 'slack',
+        ...(options.languageHint ? { languageHint: options.languageHint } : {}),
+        ...(options.threadId ? { threadId: options.threadId } : {}),
+        thread: options.thread ?? [],
+        routeToOrchestrator: options.routeToOrchestrator ?? true,
+        requestedBy: options.requestedBy ?? 'founder',
+        autonomyLevel: options.autonomyLevel ?? 'suggest',
       }
+    }
+
+    return {
+      message: inputOrMessage.message,
+      projectId: inputOrMessage.projectId,
+      organizationId: inputOrMessage.organizationId ?? inputOrMessage.projectId,
+      senderId: inputOrMessage.senderId,
+      source: inputOrMessage.source ?? 'slack',
+      ...(inputOrMessage.languageHint ? { languageHint: inputOrMessage.languageHint } : {}),
+      ...(inputOrMessage.threadId ? { threadId: inputOrMessage.threadId } : {}),
+      thread: inputOrMessage.thread ?? [],
+      routeToOrchestrator: inputOrMessage.routeToOrchestrator ?? true,
+      requestedBy: inputOrMessage.requestedBy ?? 'founder',
+      autonomyLevel: inputOrMessage.autonomyLevel ?? 'suggest',
     }
   }
 
-  // -------------------------------------------------------------------------
-  // 3. handleApprovalMessage
-  // -------------------------------------------------------------------------
+  private async classifyWithHaiku(message: string, input: NormalizedInput): Promise<AiClassification> {
+    const threadSnippet = input.thread
+      .slice(-this.maxThreadMessages)
+      .map((turn) => `[${turn.role}] ${turn.text}`)
+      .join('\n')
 
-  /**
-   * Detect approval or rejection keywords/tokens in a message and route
-   * them to the ApprovalGateway.
-   *
-   * Positive signals: yes, approve, approved, go ahead, ship it, do it, lgtm
-   * Negative signals: no, reject, rejected, cancel, stop, decline
-   *
-   * @param message   - Inbound message text.
-   * @param projectId - Project scope.
-   * @returns ApprovalAction if an approval token was resolved, else null.
-   */
-  async handleApprovalMessage(
-    message: string,
-    projectId: string,
-  ): Promise<ApprovalAction | null> {
-    const msgLower = message.trim().toLowerCase()
-
-    const approvePatterns = ['yes', 'approve', 'approved', 'go ahead', 'ship it', 'do it', 'lgtm', 'looks good']
-    const rejectPatterns = ['no', 'reject', 'rejected', 'cancel', 'stop', 'decline', 'abort']
-
-    const isApproval = approvePatterns.some((p) => msgLower.includes(p))
-    const isRejection = rejectPatterns.some((p) => msgLower.includes(p))
-
-    if (\!isApproval && \!isRejection) return null
-
-    // Look for a pending approval request for this project
-    try {
-      const pendingApproval = await prisma.approvalRequest.findFirst({
-        where: { projectId, status: 'PENDING' },
-        orderBy: { createdAt: 'desc' },
-      })
-
-      if (\!pendingApproval) {
-        log.debug({ projectId }, 'Approval signal received but no pending approval found')
-        return null
-      }
-
-      const action: ApprovalAction = {
-        action: isApproval ? 'approve' : 'reject',
-        token: isApproval ? pendingApproval.approveToken : pendingApproval.rejectToken,
-        approvalId: pendingApproval.id,
-      }
-
-      // Update the approval status
-      await prisma.approvalRequest.update({
-        where: { id: pendingApproval.id },
-        data: {
-          status: isApproval ? 'APPROVED' : 'REJECTED',
-          approvedAt: isApproval ? new Date() : undefined,
-          rejectionReason: isRejection ? 'Rejected via chat message' : undefined,
-        },
-      })
-
-      log.info({ approvalId: pendingApproval.id, action: action.action }, 'Approval resolved via chat')
-      return action
-    } catch (err) {
-      log.error({ err, projectId }, 'Failed to resolve approval message')
-      return null
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // Private helpers
-  // -------------------------------------------------------------------------
-
-  /**
-   * Identify the sender role within the organization.
-   * Returns founder, developer, or unknown.
-   */
-  private async identifySenderRole(
-    senderId: string,
-    projectId: string,
-  ): Promise<'founder' | 'developer' | 'unknown'> {
-    try {
-      const project = await prisma.project.findUnique({
-        where: { id: projectId },
-        include: { organization: { include: { members: { include: { user: true } } } } },
-      })
-      if (\!project) return 'unknown'
-      const member = project.organization.members.find((m) => m.userId === senderId)
-      if (\!member) return 'unknown'
-      switch (member.role) {
-        case 'OWNER':
-        case 'ADMIN':
-          return 'founder'
-        case 'DEVELOPER':
-          return 'developer'
-        default:
-          return 'unknown'
-      }
-    } catch {
-      return 'unknown'
-    }
-  }
-
-  /**
-   * Classify intent and extract entities via Claude Haiku.
-   */
-  private async classifyIntent(
-    message: string,
-    senderRole: string,
-  ): Promise<{
-    intentType: IntentType
-    confidence: number
-    entities: ParsedIntent['entities']
-  }> {
-    const promptText = [
-      'You are an intent classifier for a software development platform.',
-      'Sender role: ' + senderRole,
-      'Message: ' + JSON.stringify(message),
+    const userPrompt = [
+      `Source: ${input.source}`,
+      `Language hint: ${input.languageHint ?? 'none'}`,
+      'Supported intents: build_feature, fix_bug, deploy, rollback, security_scan, debt_review, unknown',
+      'Classify the following command semantically (not keyword-only) and extract entities.',
       '',
-      'Classify the intent and extract entities. Respond with ONLY a JSON object:',
+      '<message>',
+      message,
+      '</message>',
+      '',
+      '<thread_context>',
+      threadSnippet || 'none',
+      '</thread_context>',
+      '',
+      'Return ONLY valid JSON in this format:',
       '{',
-      '  "intentType": one of: bug_report|feature_request|status_query|approval|question|escalation|general_chat,',
-      '  "confidence": number 0.0-1.0,',
-      '  "affectedFeature": string or null,',
-      '  "errorMessage": string or null,',
-      '  "urgency": one of: low|medium|high|critical or null,',
-      '  "targetEnvironment": one of: preview|staging|production or null',
+      '  "intentType": "build_feature|fix_bug|deploy|rollback|security_scan|debt_review|unknown",',
+      '  "confidence": 0.0,',
+      '  "description": "string or null",',
+      '  "projectReferences": ["string"],',
+      '  "filePaths": ["string"],',
+      '  "priority": "critical|high|normal|low|null",',
+      '  "environment": "preview|staging|production|null",',
+      '  "language": "BCP-47 language tag, e.g. en or es"',
       '}',
-    ].join('
-')
+    ].join('\n')
 
     try {
       const response = await this.anthropic.messages.create({
-        model: 'claude-haiku-4-5-20251001',
+        model: this.model,
         max_tokens: 512,
-        messages: [{ role: 'user', content: promptText }],
+        temperature: 0,
+        system: [
+          'You are Forge Intent Agent, an NLP command parser for a software platform.',
+          'Be strict and return machine-readable JSON only.',
+          'Use semantic understanding. Do not require exact keyword matches.',
+        ].join('\n'),
+        messages: [{ role: 'user', content: userPrompt }],
       })
 
-      const text = response.content
-        .filter((b): b is Anthropic.TextBlock => b.type === 'text')
-        .map((b) => b.text)
+      const responseText = response.content
+        .map((block) => (block.type === 'text' ? block.text : ''))
         .join('')
 
-      const parsed = JSON.parse(text.trim()) as {
-        intentType: IntentType
-        confidence: number
-        affectedFeature?: string | null
-        errorMessage?: string | null
-        urgency?: 'low' | 'medium' | 'high' | 'critical' | null
-        targetEnvironment?: string | null
+      const parsed = parseAiResponse(responseText)
+      if (!parsed) {
+        return this.buildUnknownAiClassification()
       }
 
-      const validIntentTypes = new Set<IntentType>([
-        'bug_report', 'feature_request', 'status_query',
-        'approval', 'question', 'escalation', 'general_chat',
-      ])
-      const intentType: IntentType = validIntentTypes.has(parsed.intentType)
-        ? parsed.intentType
-        : 'general_chat'
-
-      return {
-        intentType,
-        confidence: Math.min(1, Math.max(0, parsed.confidence ?? 0.5)),
-        entities: {
-          affectedFeature: parsed.affectedFeature ?? undefined,
-          errorMessage: parsed.errorMessage ?? undefined,
-          urgency: parsed.urgency ?? undefined,
-          targetEnvironment: parsed.targetEnvironment ?? undefined,
-        },
+      const classification: AiClassification = {
+        type: normalizeIntentType(parsed.intentType),
+        confidence: clamp(typeof parsed.confidence === 'number' ? parsed.confidence : 0.35, 0, 1),
+        projectReferences: ensureStringArray(parsed.projectReferences),
+        filePaths: ensureStringArray(parsed.filePaths),
       }
+
+      if (isMeaningfulText(parsed.description)) {
+        classification.description = parsed.description.trim()
+      }
+
+      const priority = normalizePriority(parsed.priority)
+      if (priority) {
+        classification.priority = priority
+      }
+
+      const environment = normalizeEnvironment(parsed.environment)
+      if (environment) {
+        classification.environment = environment
+      }
+
+      const language = normalizeLanguage(parsed.language)
+      if (language) {
+        classification.language = language
+      }
+
+      return classification
     } catch (err) {
-      log.error({ err }, 'Haiku intent classification failed')
-      return { intentType: 'general_chat', confidence: 0.3, entities: {} }
+      log.warn({ err }, 'Haiku intent classification failed; using regex-first fallback')
+      return this.buildUnknownAiClassification()
     }
   }
 
-  /**
-   * Enrich context based on detected intent type.
-   * bug_report: fetch recent errors from last 1h
-   * feature_request: estimate complexity via Sonnet
-   * status_query: fetch current metrics
-   */
-  private async enrichContext(
-    intentType: IntentType,
-    entities: ParsedIntent['entities'],
-    projectId: string,
-  ): Promise<Record<string, unknown>> {
-    switch (intentType) {
-      case 'bug_report':
-        return this.enrichBugReport(projectId, entities.affectedFeature)
-      case 'feature_request':
-        return this.enrichFeatureRequest(projectId, entities.affectedFeature)
-      case 'status_query':
-        return this.enrichStatusQuery(projectId)
-      default:
-        return {}
+  private buildUnknownAiClassification(): AiClassification {
+    return {
+      type: 'unknown',
+      confidence: 0.25,
+      projectReferences: [],
+      filePaths: [],
     }
   }
 
-  private async enrichBugReport(
-    projectId: string,
-    featureName?: string,
-  ): Promise<Record<string, unknown>> {
-    try {
-      const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000)
-      const recentIncidents = await prisma.incident.findMany({
-        where: {
-          projectId,
-          detectedAt: { gte: oneHourAgo },
-          ...(featureName ? { affectedModules: { has: featureName } } : {}),
-        },
-        orderBy: { detectedAt: 'desc' },
-        take: 5,
-      })
-      return {
-        recentIncidents: recentIncidents.map((i) => ({
-          id: i.id,
-          title: i.title,
-          severity: i.severity,
-          detectedAt: i.detectedAt,
-          affectedModules: i.affectedModules,
-        })),
-        relatedIncidentCount: recentIncidents.length,
-      }
-    } catch {
-      return {}
-    }
-  }
+  private extractEntitiesByRegex(message: string, thread: ConversationTurn[]): RegexExtraction {
+    const projectReferences = extractProjectReferences(message)
+    const filePaths = extractFilePaths(message)
+    const priority = extractPriority(message)
+    const environment = extractEnvironment(message)
 
-  /**
-   * Use Claude Sonnet for feature complexity estimation — requires deeper
-   * reasoning about codebase architecture than Haiku provides.
-   */
-  private async enrichFeatureRequest(
-    projectId: string,
-    featureName?: string,
-  ): Promise<Record<string, unknown>> {
-    try {
-      const context = await prisma.codebaseContext.findFirst({
-        where: { projectId },
-        include: { modules: true },
-      })
-      if (\!context || \!featureName) return {}
+    const threadProjectReferences =
+      projectReferences.length > 0
+        ? []
+        : extractProjectReferences(
+            thread
+              .slice(-this.maxThreadMessages)
+              .map((turn) => turn.text)
+              .join(' '),
+          )
 
-      const moduleList = context.modules
-        .slice(0, 20)
-        .map((m) => m.path + ': ' + m.plainEnglishDescription)
-        .join('
-')
-
-      const complexityResponse = await this.anthropic.messages.create({
-        model: 'claude-sonnet-4-6',
-        max_tokens: 512,
-        messages: [{
-          role: 'user',
-          content:
-            'Estimate the complexity of implementing this feature: "' + featureName + '"
-
-' +
-            'Existing modules:
-' + moduleList + '
-
-' +
-            'Respond with ONLY a JSON object: {"complexity": "low|medium|high", "estimatedDays": number, "rationale": "one sentence"}',
-        }],
-      })
-
-      const text = complexityResponse.content
-        .filter((b): b is Anthropic.TextBlock => b.type === 'text')
-        .map((b) => b.text)
-        .join('')
-
-      const estimate = JSON.parse(text.trim()) as {
-        complexity: string
-        estimatedDays: number
-        rationale: string
-      }
-      return { complexityEstimate: estimate }
-    } catch {
-      return {}
-    }
-  }
-
-  private async enrichStatusQuery(projectId: string): Promise<Record<string, unknown>> {
-    try {
-      const latest = await prisma.projectMetricsSnapshot.findFirst({
-        where: { projectId },
-        orderBy: { capturedAt: 'desc' },
-      })
-      return { currentMetrics: latest ?? {} }
-    } catch {
-      return {}
-    }
-  }
-
-  private async buildAgentTask(
-    intentType: IntentType,
-    entities: ParsedIntent['entities'],
-    enrichedContext: Record<string, unknown>,
-    projectId: string,
-  ): Promise<Partial<AgentTask> | undefined> {
-    const actionableIntents: IntentType[] = ['bug_report', 'feature_request', 'escalation']
-    if (\!actionableIntents.includes(intentType)) return undefined
-
-    try {
-      const project = await prisma.project.findUnique({
-        where: { id: projectId },
-        select: { organizationId: true, autonomyLevel: true },
-      })
-      if (\!project) return undefined
-
-      const taskType = intentType === 'bug_report' ? 'FIX_BUG'
-        : intentType === 'feature_request' ? 'BUILD_FEATURE'
-        : 'FIX_INCIDENT'
-
-      const priority = entities.urgency === 'critical' ? 'CRITICAL'
-        : entities.urgency === 'high' ? 'HIGH'
-        : 'NORMAL'
-
-      const task = await prisma.agentTask.create({
-        data: {
-          id: randomUUID(),
-          projectId,
-          type: taskType,
-          priority,
-          agentType: intentType === 'bug_report' ? 'FIXER' : 'BUILDER',
-          requestedBy: 'FOUNDER',
-          autonomyLevel: project.autonomyLevel ?? 'SUGGEST',
-          payload: { intentType, entities, enrichedContext },
-        },
-      })
-
-      return {
-        id: task.id,
-        type: intentType === 'bug_report' ? 'fix_bug' : 'build_feature',
-        projectId,
-        organizationId: project.organizationId,
-        payload: task.payload as Record<string, unknown>,
-        requestedBy: 'founder',
-        autonomyLevel: (project.autonomyLevel?.toLowerCase() ?? 'suggest') as 'suggest' | 'semi' | 'autonomous',
-        priority: priority.toLowerCase() as 'critical' | 'high' | 'normal' | 'low',
-        createdAt: task.createdAt,
-      }
-    } catch (err) {
-      log.error({ err, intentType }, 'Failed to build agent task')
-      return undefined
-    }
-  }
-
-  private buildClarificationQuestion(
-    intentType: IntentType,
-    entities: ParsedIntent['entities'],
-  ): string {
-    if (intentType === 'bug_report' && \!entities.affectedFeature) {
-      return 'Which part of the product is affected by this bug?'
-    }
-    if (intentType === 'feature_request' && \!entities.affectedFeature) {
-      return 'Could you describe the feature you have in mind in more detail?'
-    }
-    if (intentType === 'status_query') {
-      return 'Which service or metric would you like a status update on?'
-    }
-    return 'Could you clarify what you need help with?'
-  }
-
-  private buildUnderstoodStatement(parsed: ParsedIntent): string {
-    switch (parsed.intentType) {
-      case 'bug_report':
-        return parsed.entities.affectedFeature
-          ? 'I understood you are reporting a bug in ' + parsed.entities.affectedFeature + '.'
-          : 'I understood you are reporting a bug.'
-      case 'feature_request':
-        return parsed.entities.affectedFeature
-          ? 'I understood you want to add: ' + parsed.entities.affectedFeature + '.'
-          : 'I understood you have a feature request.'
-      case 'status_query':
-        return 'I understood you want a status update on the project.'
-      case 'approval':
-        return 'I understood you want to approve or reject a pending action.'
-      case 'escalation':
-        return 'I understood this is an escalation that needs immediate attention.'
-      case 'question':
-        return 'I understood you have a question.'
-      default:
-        return 'I received your message.'
-    }
-  }
-
-  private buildActionStatement(parsed: ParsedIntent): {
-    action: string
-    timeline?: string
-    needsApproval: boolean
-  } {
-    switch (parsed.intentType) {
-      case 'bug_report':
-        return {
-          action: 'I am creating a bug fix task and assigning it to the Fixer agent.',
-          timeline: parsed.entities.urgency === 'critical' ? 'Immediately' : 'Within the next sprint',
-          needsApproval: false,
-        }
-      case 'feature_request':
-        return {
-          action: 'I am creating a feature task. It will require your approval before implementation begins.',
-          timeline: 'Estimated in the complexity analysis above',
-          needsApproval: true,
-        }
-      case 'status_query':
-        return { action: 'Here are the current metrics for your project.', needsApproval: false }
-      case 'escalation':
-        return {
-          action: 'I am escalating this to critical priority and paging on-call.',
-          timeline: 'Immediately',
-          needsApproval: false,
-        }
-      case 'approval':
-        return { action: 'Processing your approval decision now.', needsApproval: false }
-      default:
-        return { action: 'No automated action is required for this message.', needsApproval: false }
-    }
-  }
-
-  private async buildApprovalNotification(
-    parsed: ParsedIntent,
-    projectId: string,
-  ): Promise<ApprovalNotification> {
-    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000)
-    const project = await prisma.project.findUnique({
-      where: { id: projectId },
-      select: { name: true },
-    })
-    const approveToken = randomUUID()
-    const rejectToken = randomUUID()
-    const approvalId = randomUUID()
+    const fallbackDescription = isMeaningfulText(message) ? message.trim() : undefined
 
     return {
-      summary: parsed.entities.affectedFeature
-        ? 'Approve feature: ' + parsed.entities.affectedFeature
-        : 'Approve pending action',
-      businessImpact: 'This action will be executed by the Builder agent upon approval.',
-      riskLevel: 'medium',
-      confidenceScore: Math.round(parsed.confidence * 100),
-      approveToken,
-      rejectToken,
-      expiresAt,
-      approvalId,
-      projectName: project?.name ?? 'Unknown Project',
+      projectReferences: uniqueStrings([...projectReferences, ...threadProjectReferences]),
+      filePaths: uniqueStrings(filePaths),
+      ...(priority ? { priority } : {}),
+      ...(environment ? { environment } : {}),
+      ...(fallbackDescription ? { description: fallbackDescription } : {}),
     }
   }
+
+  private resolveIntentType(
+    message: string,
+    aiClassification: AiClassification,
+    thread: ConversationTurn[],
+  ): IntentType {
+    const heuristicType = this.inferIntentFromText(message)
+    const threadType = this.inferIntentFromThread(thread)
+    const contextDependent = this.looksContextDependent(message)
+
+    if (aiClassification.type !== 'unknown' && aiClassification.confidence >= 0.45) {
+      return aiClassification.type
+    }
+
+    if (heuristicType !== 'unknown') {
+      return heuristicType
+    }
+
+    if (contextDependent && threadType !== 'unknown') {
+      return threadType
+    }
+
+    return aiClassification.type
+  }
+
+  private mergeEntities(params: {
+    type: IntentType
+    sanitizedMessage: string
+    regexExtraction: RegexExtraction
+    aiClassification: AiClassification
+    input: NormalizedInput
+  }): IntentEntities {
+    const { type, sanitizedMessage, regexExtraction, aiClassification, input } = params
+
+    const projectReferences = uniqueStrings([
+      ...regexExtraction.projectReferences,
+      ...aiClassification.projectReferences,
+    ])
+    const filePaths = uniqueStrings([...regexExtraction.filePaths, ...aiClassification.filePaths])
+    const priority = regexExtraction.priority ?? aiClassification.priority
+    const environment = regexExtraction.environment ?? aiClassification.environment
+
+    const aiDescription = aiClassification.description
+    const commandDescription = this.extractDescriptionFromCommand(sanitizedMessage, type)
+    const contextDescription = this.extractDescriptionFromThread(input.thread)
+    const description =
+      aiDescription ?? commandDescription ?? (this.looksContextDependent(sanitizedMessage) ? contextDescription : undefined)
+
+    const language =
+      aiClassification.language ??
+      normalizeLanguage(input.languageHint) ??
+      (containsLatinLetters(sanitizedMessage) ? 'en' : 'unknown')
+
+    return {
+      projectReferences,
+      filePaths,
+      ...(description ? { description } : {}),
+      ...(priority ? { priority } : {}),
+      ...(environment ? { environment } : {}),
+      language,
+    }
+  }
+
+  private inferIntentFromText(message: string): IntentType {
+    const normalized = message.toLowerCase()
+
+    if (matchesAny(normalized, [/\broll\s?back\b/i, /\brevert\b/i, /\bback out\b/i])) {
+      return 'rollback'
+    }
+    if (matchesAny(normalized, [/\bdeploy\b/i, /\brelease\b/i, /\bpush\s+live\b/i, /\bship\b/i])) {
+      return 'deploy'
+    }
+    if (matchesAny(normalized, [/\bsecurity\b/i, /\bvulnerab/i, /\baudit\b/i, /\bscan\b/i])) {
+      return 'security_scan'
+    }
+    if (matchesAny(normalized, [/\btechnical\s+debt\b/i, /\bdebt\s+review\b/i, /\bcode\s+debt\b/i])) {
+      return 'debt_review'
+    }
+    if (matchesAny(normalized, [/\bfix\b/i, /\bbug\b/i, /\bbroken\b/i, /\bissue\b/i, /\berror\b/i])) {
+      return 'fix_bug'
+    }
+    if (matchesAny(normalized, [/\bbuild\b/i, /\bcreate\b/i, /\bimplement\b/i, /\badd\b/i, /\bfeature\b/i])) {
+      return 'build_feature'
+    }
+
+    return 'unknown'
+  }
+
+  private inferIntentFromThread(thread: ConversationTurn[]): IntentType {
+    for (let i = thread.length - 1; i >= 0; i -= 1) {
+      const turn = thread[i]
+      if (turn.role !== 'user') continue
+      const inferred = this.inferIntentFromText(turn.text)
+      if (inferred !== 'unknown') {
+        return inferred
+      }
+    }
+    return 'unknown'
+  }
+
+  private looksContextDependent(message: string): boolean {
+    const normalized = message.trim().toLowerCase()
+    if (normalized.length <= 14) {
+      return true
+    }
+
+    return matchesAny(normalized, [
+      /\bdo\s+it\b/i,
+      /\bdo\s+that\b/i,
+      /\bthat\b/i,
+      /\bthis\b/i,
+      /\bsame\b/i,
+      /\bgo\s+ahead\b/i,
+    ])
+  }
+
+  private extractDescriptionFromThread(thread: ConversationTurn[]): string | undefined {
+    for (let i = thread.length - 1; i >= 0; i -= 1) {
+      const turn = thread[i]
+      if (turn.role !== 'user') continue
+      if (isMeaningfulText(turn.text)) {
+        return turn.text.trim()
+      }
+    }
+    return undefined
+  }
+
+  private extractDescriptionFromCommand(message: string, type: IntentType): string | undefined {
+    const normalized = message.trim()
+
+    const clean = (value: string): string =>
+      value
+        .replace(/^please\s+/i, '')
+        .replace(/^can\s+you\s+/i, '')
+        .replace(/^could\s+you\s+/i, '')
+        .replace(/^for\s+project\s+[A-Za-z0-9._/-]+\s*/i, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+
+    let description = normalized
+    switch (type) {
+      case 'build_feature':
+        description = description.replace(/^(build|create|implement|add)\s+/i, '')
+        break
+      case 'fix_bug':
+        description = description.replace(/^(fix|resolve|debug|repair|patch)\s+/i, '')
+        break
+      case 'deploy':
+        description = description.replace(/^(deploy|release|ship)\s+/i, '')
+        break
+      case 'rollback':
+        description = description.replace(/^(rollback|roll\s?back|revert)\s+/i, '')
+        break
+      case 'security_scan':
+        description = description.replace(/^(check|run|scan)\s+/i, '')
+        break
+      case 'debt_review':
+        description = description.replace(/^(show|review|analyze)\s+/i, '')
+        break
+      default:
+        break
+    }
+
+    const cleaned = clean(description)
+    return isMeaningfulText(cleaned) ? cleaned : undefined
+  }
+
+  private computeConfidence(params: {
+    type: IntentType
+    message: string
+    entities: IntentEntities
+    aiConfidence: number
+    threadUsed: boolean
+  }): number {
+    const { type, message, entities, aiConfidence, threadUsed } = params
+
+    const aiScore = clamp(aiConfidence, 0, 1)
+    const keywordScore = this.keywordSignal(type, message)
+    const entityScore = this.entityCompleteness(type, entities)
+    const contextBoost = threadUsed ? 0.05 : 0
+
+    let total = aiScore * 0.6 + keywordScore * 0.2 + entityScore * 0.2 + contextBoost
+    if (type === 'unknown') {
+      total = Math.min(total, 0.45)
+    }
+
+    return clamp(total, 0, 1)
+  }
+
+  private keywordSignal(type: IntentType, message: string): number {
+    const normalized = message.toLowerCase()
+
+    const signals: Record<Exclude<IntentType, 'unknown'>, RegExp[]> = {
+      build_feature: [/\bbuild\b/i, /\bcreate\b/i, /\bimplement\b/i, /\bfeature\b/i, /\bpage\b/i],
+      fix_bug: [/\bfix\b/i, /\bbug\b/i, /\berror\b/i, /\bbroken\b/i, /\bissue\b/i],
+      deploy: [/\bdeploy\b/i, /\brelease\b/i, /\bship\b/i, /\bproduction\b/i, /\bstaging\b/i],
+      rollback: [/\brollback\b/i, /\broll\s?back\b/i, /\brevert\b/i, /\bundo\b/i],
+      security_scan: [/\bsecurity\b/i, /\bvulnerab/i, /\bscan\b/i, /\baudit\b/i],
+      debt_review: [/\btechnical\s+debt\b/i, /\bdebt\b/i, /\bcode\s+quality\b/i, /\brefactor\b/i],
+    }
+
+    if (type === 'unknown') {
+      return 0
+    }
+
+    const regexes = signals[type]
+    const hits = regexes.reduce((count, regex) => count + (regex.test(normalized) ? 1 : 0), 0)
+    return clamp(hits / regexes.length, 0, 1)
+  }
+
+  private entityCompleteness(type: IntentType, entities: IntentEntities): number {
+    switch (type) {
+      case 'build_feature':
+      case 'fix_bug': {
+        let score = entities.description ? 0.7 : 0.2
+        if (entities.filePaths.length > 0) score += 0.2
+        if (entities.projectReferences.length > 0) score += 0.1
+        return clamp(score, 0, 1)
+      }
+
+      case 'deploy':
+      case 'rollback':
+        return entities.environment ? 1 : 0.25
+
+      case 'security_scan':
+      case 'debt_review': {
+        let score = entities.description ? 0.75 : 0.55
+        if (entities.filePaths.length > 0) score += 0.15
+        if (entities.projectReferences.length > 0) score += 0.1
+        return clamp(score, 0, 1)
+      }
+
+      default:
+        return 0.2
+    }
+  }
+
+  private shouldAskClarification(type: IntentType, confidence: number, entities: IntentEntities): boolean {
+    if (type === 'unknown') return true
+    if (confidence < this.confidenceThreshold) return true
+
+    if ((type === 'build_feature' || type === 'fix_bug') && !entities.description) {
+      return true
+    }
+
+    if ((type === 'deploy' || type === 'rollback') && !entities.environment) {
+      return true
+    }
+
+    return false
+  }
+
+  private buildClarificationQuestion(type: IntentType, entities: IntentEntities): string {
+    if (type === 'deploy' || type === 'rollback') {
+      return 'Which environment should I target: preview, staging, or production?'
+    }
+
+    if (type === 'build_feature' && !entities.description) {
+      return 'What feature should I build? Please include a short description.'
+    }
+
+    if (type === 'fix_bug' && !entities.description) {
+      return 'What bug should I fix? Share the failing behavior and, if possible, a file path.'
+    }
+
+    if (type === 'security_scan') {
+      return 'Do you want a full security scan or a dependency-focused scan?'
+    }
+
+    if (type === 'debt_review') {
+      return 'Should I review overall technical debt or specific files/modules?'
+    }
+
+    return 'Should I build a feature, fix a bug, deploy, rollback, run a security scan, or review technical debt?'
+  }
+
+  private buildStructuredTask(
+    type: IntentType,
+    entities: IntentEntities,
+    input: NormalizedInput,
+  ): Omit<AgentTask, 'id' | 'createdAt'> | undefined {
+    const priority = entities.priority ?? 'normal'
+    const basePayload = compactRecord({
+      description: entities.description,
+      projectReferences: entities.projectReferences.length > 0 ? entities.projectReferences : undefined,
+      filePaths: entities.filePaths.length > 0 ? entities.filePaths : undefined,
+      source: input.source,
+      senderId: input.senderId,
+      language: entities.language,
+      threadId: input.threadId,
+      threadContext:
+        input.thread.length > 0
+          ? input.thread
+              .slice(-this.maxThreadMessages)
+              .map((turn) => ({ role: turn.role, text: turn.text }))
+          : undefined,
+    })
+
+    const baseTask = {
+      priority,
+      projectId: input.projectId,
+      organizationId: input.organizationId,
+      requestedBy: input.requestedBy,
+      autonomyLevel: input.autonomyLevel,
+    } as const
+
+    switch (type) {
+      case 'build_feature':
+        if (!entities.description) return undefined
+        return {
+          ...baseTask,
+          type: 'build_feature',
+          payload: basePayload,
+        }
+
+      case 'fix_bug':
+        if (!entities.description) return undefined
+        return {
+          ...baseTask,
+          type: 'fix_bug',
+          payload: basePayload,
+        }
+
+      case 'deploy':
+        if (!entities.environment) return undefined
+        return {
+          ...baseTask,
+          type: 'deploy',
+          payload: compactRecord({
+            ...basePayload,
+            action: 'deploy',
+            environment: entities.environment,
+          }),
+        }
+
+      case 'rollback':
+        if (!entities.environment) return undefined
+        return {
+          ...baseTask,
+          type: 'rollback',
+          payload: compactRecord({
+            ...basePayload,
+            action: 'rollback',
+            environment: entities.environment,
+          }),
+        }
+
+      case 'security_scan':
+        return {
+          ...baseTask,
+          type: 'security_patch',
+          payload: compactRecord({
+            ...basePayload,
+            scanType: 'DEPENDENCY_AUDIT',
+            trigger: 'chat_command',
+          }),
+        }
+
+      case 'debt_review':
+        return {
+          ...baseTask,
+          type: 'update_debt_ledger',
+          payload: compactRecord({
+            ...basePayload,
+            trigger: 'chat_command',
+          }),
+        }
+
+      default:
+        return undefined
+    }
+  }
+
+  private sanitizeMessage(message: string): string {
+    return message
+      .replace(/<@[^>]+>/g, ' ')
+      .replace(/^\/\w+\s+/g, '')
+      .replace(/\s+/g, ' ')
+      .trim()
+  }
+
+  private buildUnknownResult(params: { message: string; source: IntentSource }): IntentResult {
+    return {
+      raw: params.message,
+      source: params.source,
+      type: 'unknown',
+      entities: {
+        projectReferences: [],
+        filePaths: [],
+        language: 'en',
+      },
+      confidence: 0,
+      needsClarification: true,
+      clarificationQuestion:
+        'I could not classify that command. Please tell me if this is build, fix, deploy, rollback, security scan, or debt review.',
+    }
+  }
+}
+
+interface RawAiResponse {
+  intentType?: unknown
+  confidence?: unknown
+  description?: unknown
+  projectReferences?: unknown
+  filePaths?: unknown
+  priority?: unknown
+  environment?: unknown
+  language?: unknown
+}
+
+function parseAiResponse(text: string): RawAiResponse | null {
+  const jsonCandidate = extractJsonObject(text)
+  if (!jsonCandidate) return null
+
+  try {
+    const parsed = JSON.parse(jsonCandidate) as unknown
+    if (typeof parsed !== 'object' || parsed === null) {
+      return null
+    }
+    return parsed as RawAiResponse
+  } catch {
+    return null
+  }
+}
+
+function extractJsonObject(text: string): string | null {
+  const trimmed = text.trim()
+  const withoutFence = trimmed
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```$/i, '')
+    .trim()
+
+  const firstBrace = withoutFence.indexOf('{')
+  const lastBrace = withoutFence.lastIndexOf('}')
+  if (firstBrace === -1 || lastBrace === -1 || lastBrace < firstBrace) {
+    return null
+  }
+
+  return withoutFence.slice(firstBrace, lastBrace + 1)
+}
+
+function normalizeIntentType(value: unknown): IntentType {
+  if (typeof value !== 'string') return 'unknown'
+
+  const normalized = value.trim().toLowerCase()
+  switch (normalized) {
+    case 'build_feature':
+    case 'fix_bug':
+    case 'deploy':
+    case 'rollback':
+    case 'security_scan':
+    case 'debt_review':
+      return normalized
+    default:
+      return 'unknown'
+  }
+}
+
+function normalizePriority(value: unknown): TaskPriority | undefined {
+  if (typeof value !== 'string') return undefined
+  const normalized = value.trim().toLowerCase()
+  switch (normalized) {
+    case 'critical':
+    case 'high':
+    case 'normal':
+    case 'low':
+      return normalized
+    case 'urgent':
+    case 'asap':
+      return 'critical'
+    case 'medium':
+      return 'normal'
+    default:
+      return undefined
+  }
+}
+
+function normalizeEnvironment(value: unknown): DeployEnvironment | undefined {
+  if (typeof value !== 'string') return undefined
+  const normalized = value.trim().toLowerCase()
+  switch (normalized) {
+    case 'preview':
+      return 'preview'
+    case 'staging':
+      return 'staging'
+    case 'production':
+    case 'prod':
+      return 'production'
+    default:
+      return undefined
+  }
+}
+
+function normalizeLanguage(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined
+  const normalized = value.trim()
+  if (!normalized) return undefined
+
+  if (/^[a-z]{2}(?:-[A-Z]{2})?$/.test(normalized)) {
+    return normalized
+  }
+
+  if (/^[a-z]{2}$/i.test(normalized)) {
+    return normalized.toLowerCase()
+  }
+
+  return undefined
+}
+
+function parseThread(value: unknown): ConversationTurn[] {
+  if (!Array.isArray(value)) return []
+  const turns: ConversationTurn[] = []
+  for (const item of value) {
+    const turn = parseConversationTurn(item)
+    if (turn) turns.push(turn)
+  }
+  return turns
+}
+
+function parseConversationTurn(value: unknown): ConversationTurn | null {
+  if (typeof value !== 'object' || value === null) return null
+  const raw = value as Record<string, unknown>
+  const role = raw['role']
+  const text = raw['text']
+  if ((role !== 'user' && role !== 'assistant') || typeof text !== 'string') {
+    return null
+  }
+
+  const timestampValue = raw['timestamp']
+  if (typeof timestampValue === 'string' || timestampValue instanceof Date) {
+    const timestamp = new Date(timestampValue)
+    if (!Number.isNaN(timestamp.getTime())) {
+      return { role, text, timestamp }
+    }
+  }
+
+  return { role, text }
+}
+
+function normalizeSource(value: unknown): IntentSource {
+  if (typeof value !== 'string') return 'slack'
+  const normalized = value.trim().toLowerCase()
+  return normalized === 'telegram' ? 'telegram' : 'slack'
+}
+
+function extractProjectReferences(text: string): string[] {
+  const matches: string[] = []
+  const regex = /\b(?:project|repo|repository)\s*(?:[:#]\s*|\s+)([A-Za-z0-9._/-]+)/gi
+  let match: RegExpExecArray | null
+  while ((match = regex.exec(text)) !== null) {
+    const ref = match[1]
+    if (ref) {
+      matches.push(ref)
+    }
+  }
+  return uniqueStrings(matches)
+}
+
+function extractFilePaths(text: string): string[] {
+  const matches: string[] = []
+  const regex = /((?:\.{1,2}\/|\/)?(?:[A-Za-z0-9_-]+\/)+[A-Za-z0-9._-]+\.[A-Za-z0-9._-]+)/g
+  let match: RegExpExecArray | null
+  while ((match = regex.exec(text)) !== null) {
+    const filePath = match[1]
+    if (filePath && !filePath.startsWith('http')) {
+      matches.push(filePath)
+    }
+  }
+  return uniqueStrings(matches)
+}
+
+function extractPriority(text: string): TaskPriority | undefined {
+  if (matchesAny(text, [/\bcritical\b/i, /\burgent\b/i, /\basap\b/i, /\bp0\b/i, /\bsev\s*1\b/i])) {
+    return 'critical'
+  }
+  if (matchesAny(text, [/\bhigh\s+priority\b/i, /\bimportant\b/i, /\bsoon\b/i, /\bp1\b/i])) {
+    return 'high'
+  }
+  if (matchesAny(text, [/\blow\s+priority\b/i, /\bwhenever\b/i, /\blater\b/i, /\bbacklog\b/i])) {
+    return 'low'
+  }
+  return undefined
+}
+
+function extractEnvironment(text: string): DeployEnvironment | undefined {
+  if (matchesAny(text, [/\bproduction\b/i, /\bprod\b/i])) {
+    return 'production'
+  }
+  if (matchesAny(text, [/\bstaging\b/i])) {
+    return 'staging'
+  }
+  if (matchesAny(text, [/\bpreview\b/i])) {
+    return 'preview'
+  }
+  return undefined
+}
+
+function ensureStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return []
+  return uniqueStrings(
+    value
+      .filter((entry): entry is string => typeof entry === 'string')
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0),
+  )
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values.map((value) => value.trim()).filter((value) => value !== '')))
+}
+
+function compactRecord(record: Record<string, unknown>): Record<string, unknown> {
+  const compacted: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(record)) {
+    if (value !== undefined) {
+      compacted[key] = value
+    }
+  }
+  return compacted
+}
+
+function clamp(value: number, min: number, max: number): number {
+  if (value < min) return min
+  if (value > max) return max
+  return value
+}
+
+function matchesAny(value: string, patterns: RegExp[]): boolean {
+  return patterns.some((pattern) => pattern.test(value))
+}
+
+function isMeaningfulText(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length >= 3
+}
+
+function containsLatinLetters(value: string): boolean {
+  return /[A-Za-z]/.test(value)
 }

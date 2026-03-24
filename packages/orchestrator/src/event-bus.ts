@@ -11,7 +11,7 @@
 
 import { Queue, Worker, QueueEvents, type Job, type JobsOptions } from 'bullmq'
 import { createLogger } from '@forge/shared'
-import type { AgentType, AgentTask, ForgeEvent, ForgeEventType } from '@forge/shared'
+import type { AgentType, AgentTask, ForgeEvent } from '@forge/shared'
 import { prisma } from '@forge/database'
 import type { Redis } from 'ioredis'
 
@@ -181,6 +181,32 @@ export class EventBus {
     })
 
     log.info({ agentType, concurrency }, 'Worker registered')
+    return worker
+  }
+
+  registerEventWorker(
+    processor: (event: ForgeEvent<unknown>) => Promise<void>,
+    concurrency = 8,
+  ): Worker<ForgeEvent<unknown>> {
+    const worker = new Worker<ForgeEvent<unknown>>(
+      QUEUE_NAMES.events,
+      async (job) => {
+        await processor(job.data)
+      },
+      {
+        connection: this.redis,
+        concurrency,
+      },
+    )
+
+    worker.on('failed', (job, error) => {
+      log.error(
+        { jobId: job?.id, eventType: job?.name, error: error.message },
+        'Event worker failed to process event',
+      )
+    })
+
+    log.info({ concurrency }, 'Event worker registered')
     return worker
   }
 

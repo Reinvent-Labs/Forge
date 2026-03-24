@@ -11,15 +11,14 @@
 import Fastify from 'fastify'
 import cors from '@fastify/cors'
 import helmet from '@fastify/helmet'
-import { Server as SocketServer } from 'socket.io'
-import { createServer } from 'http'
 import { z } from 'zod'
-import { createLogger } from '@forge/shared'
+import { createLogger, type AgentTask } from '@forge/shared'
 import { initOrchestrator } from './index.js'
 import { registerProjectRoutes } from './routes/projects.js'
 import { registerWebhookRoutes } from './routes/webhooks.js'
 import { registerAuthRoutes } from './routes/auth.js'
 import { CronScheduler } from './cron.js'
+import { WebSocketServer } from './websocket.js'
 
 const log = createLogger('server')
 const PORT = parseInt(process.env['PORT'] ?? '4000', 10)
@@ -32,7 +31,6 @@ async function start(): Promise<void> {
   // ---------------------------------------------------------------------------
 
   const app = Fastify({ logger: false, trustProxy: true })
-  const httpServer = createServer(app.server)
 
   await app.register(cors, {
     origin: process.env['DASHBOARD_URL'] ?? 'http://localhost:3000',
@@ -43,28 +41,24 @@ async function start(): Promise<void> {
     contentSecurityPolicy: false,  // handled by Next.js
   })
 
-  // ---------------------------------------------------------------------------
-  // Socket.io for real-time dashboard updates
-  // ---------------------------------------------------------------------------
-
-  const io = new SocketServer(httpServer, {
-    cors: {
-      origin: process.env['DASHBOARD_URL'] ?? 'http://localhost:3000',
-      credentials: true,
-    },
+  const websocketServer = new WebSocketServer({
+    eventBus: orchestrator.eventBus,
+    path: '/ws',
   })
 
-  io.on('connection', (socket) => {
-    log.info({ socketId: socket.id }, 'Dashboard client connected')
+  websocketServer.start()
 
-    socket.on('subscribe:project', (projectId: string) => {
-      void socket.join(`project:${projectId}`)
-      log.debug({ socketId: socket.id, projectId }, 'Client subscribed to project')
-    })
+  app.server.on('upgrade', (request, socket, head) => {
+    if (!websocketServer.isWebSocketRequest(request)) {
+      socket.destroy()
+      return
+    }
 
-    socket.on('disconnect', () => {
-      log.debug({ socketId: socket.id }, 'Dashboard client disconnected')
-    })
+    websocketServer.handleUpgrade(request, socket, head)
+  })
+
+  app.get('/ws', async (_request, reply) => {
+    return reply.status(426).send({ error: 'Upgrade Required' })
   })
 
   // ---------------------------------------------------------------------------
@@ -168,9 +162,8 @@ async function start(): Promise<void> {
 
   try {
     await app.ready()
-    httpServer.listen(PORT, '0.0.0.0', () => {
-      log.info({ port: PORT }, 'Forge Orchestrator started')
-    })
+    await app.listen({ port: PORT, host: '0.0.0.0' })
+    log.info({ port: PORT }, 'Forge Orchestrator started')
   } catch (err) {
     log.error({ error: (err as Error).message }, 'Failed to start server')
     process.exit(1)
@@ -180,7 +173,8 @@ async function start(): Promise<void> {
   const shutdown = async (signal: string) => {
     log.info({ signal }, 'Shutting down...')
     cron.stop()
-    httpServer.close()
+    await websocketServer.close()
+    await app.close()
     await orchestrator.close()
     process.exit(0)
   }

@@ -1,50 +1,4 @@
-/**
- * @forge/agent-intent — Unit Tests
- *
- * Tests the IntentAgent's confidence threshold behaviour, intent type
- * validation (7 valid types), approval token detection from natural language,
- * and the generateResponse / handleApprovalMessage pipelines.
- *
- * Claude Haiku calls are mocked so the classification result is fully
- * deterministic in tests.
- */
-
-import { describe, it, expect, vi, beforeEach } from 'vitest'
-
-// ---------------------------------------------------------------------------
-// Module mocks
-// ---------------------------------------------------------------------------
-
-vi.mock('@forge/database', () => ({
-  prisma: {
-    project: {
-      findUnique: vi.fn(),
-    },
-    agentTask: {
-      create: vi.fn(),
-    },
-    incident: {
-      findMany: vi.fn(),
-    },
-    codebaseContext: {
-      findFirst: vi.fn(),
-    },
-    projectMetricsSnapshot: {
-      findFirst: vi.fn(),
-    },
-    approvalRequest: {
-      findFirst: vi.fn(),
-      update: vi.fn(),
-    },
-    organization: {
-      findFirst: vi.fn(),
-    },
-  },
-}))
-
-// ---------------------------------------------------------------------------
-// Anthropic mock — lets individual tests control the Haiku response
-// ---------------------------------------------------------------------------
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mockCreate = vi.fn()
 
@@ -70,293 +24,199 @@ vi.mock('@forge/shared', () => ({
   }),
 }))
 
-// ---------------------------------------------------------------------------
-// Import subject under test
-// ---------------------------------------------------------------------------
+import { IntentAgent, type IntentMessageInput } from './index'
 
-import { IntentAgent } from './index'
-import { prisma } from '@forge/database'
+interface MockAiPayload {
+  intentType?: string
+  confidence?: number
+  description?: string | null
+  projectReferences?: string[] | null
+  filePaths?: string[] | null
+  priority?: string | null
+  environment?: string | null
+  language?: string | null
+}
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/**
- * Make mockCreate resolve with a Haiku-style response containing a JSON
- * classification payload.
- */
-function mockHaikuResponse(payload: {
-  intentType: string
-  confidence: number
-  affectedFeature?: string | null
-  errorMessage?: string | null
-  urgency?: string | null
-  targetEnvironment?: string | null
-}) {
+function mockHaikuResponse(payload: MockAiPayload): void {
   mockCreate.mockResolvedValueOnce({
     content: [{ type: 'text', text: JSON.stringify(payload) }],
   })
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+function baseInput(message: string, source: 'slack' | 'telegram' = 'slack'): IntentMessageInput {
+  return {
+    message,
+    projectId: 'project-1',
+    organizationId: 'org-1',
+    senderId: 'user-1',
+    source,
+    routeToOrchestrator: false,
+  }
+}
 
 describe('IntentAgent', () => {
-  let agent: IntentAgent
-
   beforeEach(() => {
     vi.clearAllMocks()
-    agent = new IntentAgent()
-
-    // Default DB stubs
-    vi.mocked(prisma.project.findUnique).mockResolvedValue({
-      id: 'proj-1',
-      organizationId: 'org-1',
-      autonomyLevel: 'SUGGEST',
-      organization: {
-        members: [{ userId: 'user-founder', role: 'OWNER', user: { id: 'user-founder' } }],
-      },
-    } as never)
-
-    vi.mocked(prisma.agentTask.create).mockResolvedValue({ id: 'task-new', createdAt: new Date() } as never)
-    vi.mocked(prisma.incident.findMany).mockResolvedValue([])
-    vi.mocked(prisma.codebaseContext.findFirst).mockResolvedValue(null)
-    vi.mocked(prisma.projectMetricsSnapshot.findFirst).mockResolvedValue(null)
   })
 
-  // -------------------------------------------------------------------------
-  // Confidence threshold — < 0.7 triggers clarification
-  // -------------------------------------------------------------------------
-
-  describe('confidence threshold (CONFIDENCE_THRESHOLD = 0.7)', () => {
-    it('sets requiresClarification = true when Haiku confidence is 0.69', async () => {
-      mockHaikuResponse({ intentType: 'bug_report', confidence: 0.69 })
-      const parsed = await agent.parseMessage('something is broken', 'proj-1', 'user-founder')
-      expect(parsed.requiresClarification).toBe(true)
-      expect(parsed.clarificationQuestion).toBeDefined()
+  it('parses "Build a user profile page" as build_feature', async () => {
+    mockHaikuResponse({
+      intentType: 'build_feature',
+      confidence: 0.92,
+      description: 'user profile page',
+      language: 'en',
     })
 
-    it('sets requiresClarification = true when confidence is 0.0', async () => {
-      mockHaikuResponse({ intentType: 'general_chat', confidence: 0.0 })
-      const parsed = await agent.parseMessage('huh', 'proj-1', 'user-founder')
-      expect(parsed.requiresClarification).toBe(true)
-    })
+    const agent = new IntentAgent()
+    const result = await agent.parseMessage(baseInput('Build a user profile page', 'slack'))
 
-    it('sets requiresClarification = false when confidence is exactly 0.7', async () => {
-      mockHaikuResponse({ intentType: 'status_query', confidence: 0.7 })
-      const parsed = await agent.parseMessage('show me the metrics', 'proj-1', 'user-founder')
-      expect(parsed.requiresClarification).toBe(false)
-    })
-
-    it('sets requiresClarification = false when confidence is 0.95', async () => {
-      mockHaikuResponse({ intentType: 'bug_report', confidence: 0.95, affectedFeature: 'checkout' })
-      const parsed = await agent.parseMessage('The checkout page crashes on Safari', 'proj-1', 'user-founder')
-      expect(parsed.requiresClarification).toBe(false)
-    })
-
-    it('does NOT generate an agent task when confidence is below threshold', async () => {
-      mockHaikuResponse({ intentType: 'bug_report', confidence: 0.5 })
-      const parsed = await agent.parseMessage('something bad', 'proj-1', 'user-founder')
-      expect(parsed.generatedTask).toBeUndefined()
-    })
-
-    it('DOES generate an agent task when confidence is above threshold for an actionable intent', async () => {
-      mockHaikuResponse({ intentType: 'bug_report', confidence: 0.9, affectedFeature: 'login', urgency: 'high' })
-      const parsed = await agent.parseMessage('Login is completely broken', 'proj-1', 'user-founder')
-      expect(parsed.generatedTask).toBeDefined()
-      expect(parsed.generatedTask?.id).toBe('task-new')
-    })
+    expect(result.type).toBe('build_feature')
+    expect(result.entities.description?.toLowerCase()).toContain('user profile page')
+    expect(result.confidence).toBeGreaterThan(0.7)
+    expect(result.structuredTask?.type).toBe('build_feature')
   })
 
-  // -------------------------------------------------------------------------
-  // Intent type validation — 7 valid types
-  // -------------------------------------------------------------------------
-
-  describe('intent type validation', () => {
-    const validIntentTypes = [
-      'bug_report',
-      'feature_request',
-      'status_query',
-      'approval',
-      'question',
-      'escalation',
-      'general_chat',
-    ] as const
-
-    for (const intentType of validIntentTypes) {
-      it(`accepts valid intent type "${intentType}"`, async () => {
-        mockHaikuResponse({ intentType, confidence: 0.85 })
-        const parsed = await agent.parseMessage('test message', 'proj-1', 'user-founder')
-        expect(parsed.intentType).toBe(intentType)
-      })
-    }
-
-    it('falls back to "general_chat" for an invalid intent type from Claude', async () => {
-      // Claude returns a value not in the valid set
-      mockHaikuResponse({ intentType: 'unsupported_type' as never, confidence: 0.9 })
-      const parsed = await agent.parseMessage('test', 'proj-1', 'user-founder')
-      expect(parsed.intentType).toBe('general_chat')
+  it('parses "Fix the login bug" as fix_bug and extracts file paths via regex', async () => {
+    mockHaikuResponse({
+      intentType: 'fix_bug',
+      confidence: 0.88,
+      description: 'login bug',
+      filePaths: [],
+      language: 'en',
     })
 
-    it('falls back to "general_chat" with requiresClarification = true when Haiku throws', async () => {
-      mockCreate.mockRejectedValueOnce(new Error('API error'))
-      const parsed = await agent.parseMessage('test', 'proj-1', 'user-founder')
-      // classifyIntent catches the error and returns general_chat with confidence 0.3
-      // 0.3 < 0.7 so requiresClarification should be true
-      expect(parsed.intentType).toBe('general_chat')
-      expect(parsed.requiresClarification).toBe(true)
-    })
+    const agent = new IntentAgent()
+    const result = await agent.parseMessage(
+      baseInput('Fix the login bug in src/auth/login.ts for project storefront'),
+    )
+
+    expect(result.type).toBe('fix_bug')
+    expect(result.entities.filePaths).toContain('src/auth/login.ts')
+    expect(result.entities.projectReferences).toContain('storefront')
+    expect(result.structuredTask?.type).toBe('fix_bug')
   })
 
-  // -------------------------------------------------------------------------
-  // Approval token detection from natural language
-  // -------------------------------------------------------------------------
-
-  describe('handleApprovalMessage — approval token detection', () => {
-    const pendingApproval = {
-      id: 'approval-1',
-      projectId: 'proj-1',
-      status: 'PENDING',
-      approveToken: 'tok-approve-abc',
-      rejectToken: 'tok-reject-xyz',
-      createdAt: new Date(),
-    }
-
-    beforeEach(() => {
-      vi.mocked(prisma.approvalRequest.findFirst).mockResolvedValue(pendingApproval as never)
-      vi.mocked(prisma.approvalRequest.update).mockResolvedValue({ id: 'approval-1' } as never)
+  it('parses "Deploy to production" as deploy with production environment', async () => {
+    mockHaikuResponse({
+      intentType: 'deploy',
+      confidence: 0.9,
+      description: 'deploy latest release',
+      environment: 'production',
+      language: 'en',
     })
 
-    it('detects "yes" as an approval signal', async () => {
-      const result = await agent.handleApprovalMessage('yes', 'proj-1')
-      expect(result).not.toBeNull()
-      expect(result!.action).toBe('approve')
-      expect(result!.approvalId).toBe('approval-1')
-    })
+    const agent = new IntentAgent()
+    const result = await agent.parseMessage(baseInput('Deploy to production', 'telegram'))
 
-    it('detects "approve" as an approval signal', async () => {
-      const result = await agent.handleApprovalMessage('approve', 'proj-1')
-      expect(result!.action).toBe('approve')
-    })
-
-    it('detects "ship it" as an approval signal', async () => {
-      const result = await agent.handleApprovalMessage('ship it!', 'proj-1')
-      expect(result!.action).toBe('approve')
-    })
-
-    it('detects "lgtm" as an approval signal', async () => {
-      const result = await agent.handleApprovalMessage('lgtm, looks good', 'proj-1')
-      expect(result!.action).toBe('approve')
-    })
-
-    it('detects "no" as a rejection signal', async () => {
-      const result = await agent.handleApprovalMessage('no', 'proj-1')
-      expect(result!.action).toBe('reject')
-    })
-
-    it('detects "cancel" as a rejection signal', async () => {
-      const result = await agent.handleApprovalMessage('cancel that', 'proj-1')
-      expect(result!.action).toBe('reject')
-    })
-
-    it('detects "reject" as a rejection signal', async () => {
-      const result = await agent.handleApprovalMessage('reject the change', 'proj-1')
-      expect(result!.action).toBe('reject')
-    })
-
-    it('returns null for a message with no approval or rejection keywords', async () => {
-      const result = await agent.handleApprovalMessage('what is the status?', 'proj-1')
-      expect(result).toBeNull()
-    })
-
-    it('returns null when there is no pending approval request in the database', async () => {
-      vi.mocked(prisma.approvalRequest.findFirst).mockResolvedValue(null)
-      const result = await agent.handleApprovalMessage('yes', 'proj-1')
-      expect(result).toBeNull()
-    })
-
-    it('returns the correct approve token from the pending approval record', async () => {
-      const result = await agent.handleApprovalMessage('go ahead', 'proj-1')
-      expect(result!.token).toBe(pendingApproval.approveToken)
-    })
-
-    it('returns the correct reject token from the pending approval record', async () => {
-      const result = await agent.handleApprovalMessage('stop', 'proj-1')
-      expect(result!.token).toBe(pendingApproval.rejectToken)
-    })
-
-    it('updates the approval record status to APPROVED when approved', async () => {
-      await agent.handleApprovalMessage('approved', 'proj-1')
-      expect(prisma.approvalRequest.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { id: 'approval-1' },
-          data: expect.objectContaining({ status: 'APPROVED' }),
-        }),
-      )
-    })
-
-    it('updates the approval record status to REJECTED when rejected', async () => {
-      await agent.handleApprovalMessage('decline', 'proj-1')
-      expect(prisma.approvalRequest.update).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { id: 'approval-1' },
-          data: expect.objectContaining({ status: 'REJECTED' }),
-        }),
-      )
-    })
+    expect(result.type).toBe('deploy')
+    expect(result.entities.environment).toBe('production')
+    expect(result.structuredTask?.type).toBe('deploy')
+    expect(result.structuredTask?.payload['environment']).toBe('production')
   })
 
-  // -------------------------------------------------------------------------
-  // generateResponse — clarification response shape
-  // -------------------------------------------------------------------------
-
-  describe('generateResponse', () => {
-    it('returns a clarification response when requiresClarification is true', async () => {
-      const parsed = {
-        raw: 'some unclear message',
-        intentType: 'general_chat' as const,
-        confidence: 0.3,
-        entities: {},
-        requiresClarification: true,
-        clarificationQuestion: 'Could you clarify what you need help with?',
-      }
-      const response = await agent.generateResponse(parsed, 'proj-1')
-      expect(response.clarificationQuestion).toBeDefined()
-      expect(response.understood).toContain('clarification')
+  it('parses "Check security vulnerabilities" as security_scan', async () => {
+    mockHaikuResponse({
+      intentType: 'security_scan',
+      confidence: 0.87,
+      description: 'check security vulnerabilities',
+      language: 'en',
     })
 
-    it('returns a bug-report response with timeline when intent is bug_report', async () => {
-      const parsed = {
-        raw: 'checkout is broken',
-        intentType: 'bug_report' as const,
-        confidence: 0.9,
-        entities: { affectedFeature: 'checkout', urgency: 'critical' as const },
-        requiresClarification: false,
-      }
-      const response = await agent.generateResponse(parsed, 'proj-1')
-      expect(response.understood).toContain('checkout')
-      expect(response.action).toContain('Fixer')
-      expect(response.timeline).toBe('Immediately')
+    const agent = new IntentAgent()
+    const result = await agent.parseMessage(baseInput('Check security vulnerabilities'))
+
+    expect(result.type).toBe('security_scan')
+    expect(result.structuredTask?.type).toBe('security_patch')
+    expect(result.structuredTask?.payload['scanType']).toBe('DEPENDENCY_AUDIT')
+  })
+
+  it('parses "Show me technical debt" as debt_review', async () => {
+    mockHaikuResponse({
+      intentType: 'debt_review',
+      confidence: 0.85,
+      description: 'show technical debt',
+      language: 'en',
     })
 
-    it('sets needsApproval = true for a feature_request intent', async () => {
-      vi.mocked(prisma.project.findUnique).mockResolvedValue({
-        id: 'proj-1',
-        name: 'Test Project',
-        organizationId: 'org-1',
-      } as never)
+    const agent = new IntentAgent()
+    const result = await agent.parseMessage(baseInput('Show me technical debt'))
 
-      const parsed = {
-        raw: 'add dark mode',
-        intentType: 'feature_request' as const,
-        confidence: 0.85,
-        entities: { affectedFeature: 'dark mode' },
-        requiresClarification: false,
-      }
-      const response = await agent.generateResponse(parsed, 'proj-1')
-      expect(response.needsApproval).toBe(true)
-      expect(response.approvalNotification).toBeDefined()
+    expect(result.type).toBe('debt_review')
+    expect(result.structuredTask?.type).toBe('update_debt_ledger')
+    expect(result.structuredTask?.payload['trigger']).toBe('chat_command')
+  })
+
+  it('asks a clarifying question for ambiguous requests', async () => {
+    mockHaikuResponse({
+      intentType: 'unknown',
+      confidence: 0.22,
+      description: null,
+      language: 'en',
     })
+
+    const agent = new IntentAgent()
+    const result = await agent.parseMessage(baseInput('Can you handle that?'))
+
+    expect(result.type).toBe('unknown')
+    expect(result.needsClarification).toBe(true)
+    expect(result.clarificationQuestion).toBeDefined()
+    expect(result.structuredTask).toBeUndefined()
+  })
+
+  it('uses thread context to recover missing description details', async () => {
+    mockHaikuResponse({
+      intentType: 'fix_bug',
+      confidence: 0.78,
+      description: null,
+      filePaths: [],
+      language: 'en',
+    })
+
+    const agent = new IntentAgent()
+    const result = await agent.parseMessage({
+      ...baseInput('Do that in src/auth/login.ts'),
+      thread: [
+        { role: 'user', text: 'Fix the login bug on Safari' },
+        { role: 'assistant', text: 'Got it, I can work on that.' },
+      ],
+    })
+
+    expect(result.type).toBe('fix_bug')
+    expect(result.entities.description).toContain('Fix the login bug on Safari')
+    expect(result.entities.filePaths).toContain('src/auth/login.ts')
+  })
+
+  it('routes parsed intents to orchestrator when configured', async () => {
+    mockHaikuResponse({
+      intentType: 'deploy',
+      confidence: 0.94,
+      description: 'deploy now',
+      environment: 'production',
+      language: 'en',
+    })
+
+    const processTask = vi.fn().mockResolvedValue('task-42')
+    const agent = new IntentAgent({
+      orchestrator: { processTask },
+    })
+
+    const result = await agent.parseMessage({
+      ...baseInput('Deploy to production', 'slack'),
+      routeToOrchestrator: true,
+    })
+
+    expect(processTask).toHaveBeenCalledTimes(1)
+    expect(result.routedTaskId).toBe('task-42')
+    expect(result.routingError).toBeUndefined()
+  })
+
+  it('falls back to semantic heuristic classification when Haiku is unavailable', async () => {
+    mockCreate.mockRejectedValueOnce(new Error('Anthropic unavailable'))
+
+    const agent = new IntentAgent()
+    const result = await agent.parseMessage(baseInput('Ship the new profile feature'))
+
+    expect(result.type).toBe('deploy')
+    expect(result.confidence).toBeGreaterThan(0.3)
   })
 })
