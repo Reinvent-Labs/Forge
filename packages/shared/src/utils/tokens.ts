@@ -18,6 +18,10 @@ const getSecret = () => {
   return new TextEncoder().encode(secret)
 }
 
+const TOKEN_ISSUER = 'forge'
+const APPROVAL_TOKEN_TYPE = 'forge-approval'
+const SESSION_TOKEN_TYPE = 'forge-session'
+
 export interface ApprovalTokenPayload extends JWTPayload {
   approvalId: string
   action: 'approve' | 'reject'
@@ -33,7 +37,9 @@ export async function signApprovalToken(
   payload: Omit<ApprovalTokenPayload, 'iat' | 'exp'>,
 ): Promise<string> {
   return new SignJWT(payload as JWTPayload)
-    .setProtectedHeader({ alg: 'HS256' })
+    .setProtectedHeader({ alg: 'HS256', typ: APPROVAL_TOKEN_TYPE })
+    .setIssuer(TOKEN_ISSUER)
+    .setAudience(APPROVAL_TOKEN_TYPE)
     .setIssuedAt()
     .setExpirationTime('24h')
     .setJti(crypto.randomUUID())
@@ -45,9 +51,19 @@ export async function signApprovalToken(
  * Throws if invalid or expired.
  */
 export async function verifyApprovalToken(token: string): Promise<ApprovalTokenPayload> {
-  const { payload } = await jwtVerify(token, getSecret())
+  const { payload } = await jwtVerify(token, getSecret(), {
+    algorithms: ['HS256'],
+    typ: APPROVAL_TOKEN_TYPE,
+    issuer: TOKEN_ISSUER,
+    audience: APPROVAL_TOKEN_TYPE,
+  })
 
-  if (!payload['approvalId'] || !payload['action'] || !payload['projectId']) {
+  if (
+    !payload['approvalId']
+    || !payload['action']
+    || !payload['projectId']
+    || !payload['organizationId']
+  ) {
     throw new Error('Invalid approval token payload')
   }
 
@@ -67,7 +83,9 @@ export async function signSessionToken(
   payload: Omit<SessionTokenPayload, 'iat' | 'exp'>,
 ): Promise<string> {
   return new SignJWT(payload as JWTPayload)
-    .setProtectedHeader({ alg: 'HS256' })
+    .setProtectedHeader({ alg: 'HS256', typ: SESSION_TOKEN_TYPE })
+    .setIssuer(TOKEN_ISSUER)
+    .setAudience(SESSION_TOKEN_TYPE)
     .setIssuedAt()
     .setExpirationTime('7d')
     .sign(getSecret())
@@ -77,6 +95,20 @@ export async function signSessionToken(
  * Verify a session token.
  */
 export async function verifySessionToken(token: string): Promise<SessionTokenPayload> {
-  const { payload } = await jwtVerify(token, getSecret())
+  const { payload } = await jwtVerify(token, getSecret(), {
+    algorithms: ['HS256'],
+    typ: SESSION_TOKEN_TYPE,
+    issuer: TOKEN_ISSUER,
+    audience: SESSION_TOKEN_TYPE,
+  })
+
+  if (
+    typeof payload['userId'] !== 'string' || !payload['userId']
+    || typeof payload['organizationId'] !== 'string' || !payload['organizationId']
+    || typeof payload['role'] !== 'string' || !payload['role']
+  ) {
+    throw new Error('Invalid session token payload')
+  }
+
   return payload as SessionTokenPayload
 }
