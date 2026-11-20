@@ -12,6 +12,7 @@
 import { createLogger } from '@forge/shared'
 import { prisma } from '@forge/database'
 import { verifyApprovalToken } from '@forge/shared'
+import { isSlackResponseUrl } from './webhook-signatures.js'
 
 const log = createLogger('approval-gateway-handler')
 
@@ -75,13 +76,16 @@ async function processFromWebhook(
   handlerLog.info({ approvalId, newStatus }, 'Approval status updated')
 
   // 3. If Slack provided a response_url, update the original message
-  if (responseUrl) {
+  if (responseUrl && !isSlackResponseUrl(responseUrl)) {
+    handlerLog.warn('Ignoring response_url that is not an https://hooks.slack.com URL')
+  } else if (responseUrl) {
     try {
       const emoji = action === 'approve' ? '✅' : '❌'
       const verb = action === 'approve' ? 'approved' : 'rejected'
 
       await fetch(responseUrl, {
         method: 'POST',
+        redirect: 'error',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           replace_original: true,
