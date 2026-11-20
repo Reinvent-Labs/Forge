@@ -90,7 +90,7 @@ cp .env.example .env
 
 # The dashboard (Next.js) only reads env files from apps/dashboard and will not
 # start without a NEXTAUTH_SECRET of at least 32 characters:
-echo "NEXTAUTH_SECRET=$(openssl rand -base64 32)" >> apps/dashboard/.env.local
+(umask 077 && echo "NEXTAUTH_SECRET=$(openssl rand -base64 32)" >> apps/dashboard/.env.local)
 ```
 
 ### 4. Initialize Database
