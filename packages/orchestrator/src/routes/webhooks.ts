@@ -29,21 +29,23 @@ function header(request: FastifyRequest, name: string): string | undefined {
 /**
  * Vercel issues a secret per webhook, so prefer the project's own secret
  * (`webhookSecret` in its VERCEL integration config) and fall back to the
- * deployment-wide VERCEL_WEBHOOK_SECRET.
+ * deployment-wide VERCEL_WEBHOOK_SECRET. Fails closed if the lookup errors.
  */
 async function getVercelWebhookSecret(projectId: string): Promise<string | undefined> {
+  let config: unknown
   try {
     const integration = await prisma.projectIntegration.findUnique({
       where: { projectId_type: { projectId, type: 'VERCEL' } },
       select: { config: true },
     })
-    const config = integration?.config
-    if (config && typeof config === 'object' && !Array.isArray(config)) {
-      const secret = (config as Record<string, unknown>)['webhookSecret']
-      if (typeof secret === 'string' && secret.length > 0) return secret
-    }
+    config = integration?.config
   } catch (err) {
     log.warn({ projectId, error: (err as Error).message }, 'Failed to load Vercel webhook secret')
+    return undefined
+  }
+  if (config && typeof config === 'object' && !Array.isArray(config)) {
+    const secret = (config as Record<string, unknown>)['webhookSecret']
+    if (typeof secret === 'string' && secret.length > 0) return secret
   }
   return process.env['VERCEL_WEBHOOK_SECRET']
 }
