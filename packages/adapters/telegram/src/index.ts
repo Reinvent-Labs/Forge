@@ -12,7 +12,7 @@ import { Bot, InlineKeyboard } from 'grammy';
 import type { Context } from 'grammy';
 import { createLogger } from '@forge/shared';
 import type { ApprovalNotification } from '@forge/shared';
-import type { ApprovalGateway } from '@forge/orchestrator';
+import type { ApprovalGateway, ApproverIdentity } from '@forge/orchestrator';
 
 const log = createLogger('adapter-telegram');
 
@@ -56,6 +56,11 @@ export interface TelegramAdapterConfig {
   botToken: string;
   /** ApprovalGateway instance for processing approve/reject callback queries */
   approvalGateway: ApprovalGateway;
+  /**
+   * Maps Telegram user IDs to Forge account emails. Telegram users not listed
+   * here cannot approve or reject.
+   */
+  approverEmails?: Record<string, string>;
 }
 
 // =============================================================================
@@ -254,8 +259,12 @@ export class TelegramAdapter {
   /** ApprovalGateway for resolving approve/reject callback queries. */
   private readonly approvalGateway: ApprovalGateway;
 
+  /** Telegram user ID -> Forge account email. */
+  private readonly approverEmails: Record<string, string>;
+
   constructor(config: TelegramAdapterConfig) {
     this.approvalGateway = config.approvalGateway;
+    this.approverEmails = config.approverEmails ?? {};
     this.bot = new Bot(config.botToken);
 
     this.registerMessageHandlers();
@@ -476,10 +485,15 @@ ${escapeHtml(result.summary)}${prLine}`;
       log.info({ action, userId }, 'Telegram approval callback received');
 
       try {
+        const email = this.approverEmails[String(userId)];
+        if (!email) {
+          throw new Error('Your Telegram account is not linked to a Forge account');
+        }
+        const approver: ApproverIdentity = { email, displayName: username };
         const result = await this.approvalGateway.processToken(
           token,
-          username,
-          action === 'reject' ?  : undefined,
+          approver,
+          action === 'reject' ? `Rejected via Telegram by ${username}` : undefined,
         );
 
         const successText = action === 'approve'

@@ -118,9 +118,11 @@ async function start(): Promise<void> {
     }
 
     try {
+      // Unauthenticated link: no verified Forge identity, so the gateway rejects it
+      // unless the approver is resolved to a Forge member.
       const result = await orchestrator.approvalGateway.processToken(
         query.token,
-        query.by ?? 'unknown',
+        { displayName: query.by ?? 'unknown' },
       )
 
       // Redirect to dashboard

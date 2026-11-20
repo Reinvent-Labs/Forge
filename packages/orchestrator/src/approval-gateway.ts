@@ -19,6 +19,7 @@ import type {
   RiskLevel,
 } from '@forge/shared'
 import { prisma } from '@forge/database'
+import { getUserRole, hasPermission } from '@forge/auth'
 
 const log = createLogger('approval-gateway')
 
@@ -30,6 +31,24 @@ export interface CreateApprovalOptions {
   confidenceScore: ConfidenceScore
   riskLevel: RiskLevel
   previewUrl?: string
+}
+
+/**
+ * Identity of the person acting on an approval. Platform adapters must map
+ * their user (e.g. Slack/Telegram) to a Forge account via `userId` or `email`.
+ */
+export interface ApproverIdentity {
+  userId?: string
+  email?: string
+  displayName: string
+}
+
+/** Permission required to approve an action at each risk level. */
+const APPROVE_PERMISSION_BY_RISK: Record<string, string> = {
+  LOW: 'task:approve_medium',
+  MEDIUM: 'task:approve_medium',
+  HIGH: 'task:approve_high',
+  CRITICAL: 'task:approve_critical',
 }
 
 // Events emitted by the gateway
@@ -128,7 +147,7 @@ export class ApprovalGateway extends EventEmitter {
    */
   async processToken(
     token: string,
-    approvedBy: string,
+    approver: ApproverIdentity,
     rejectionReason?: string,
   ): Promise<{ action: 'approve' | 'reject'; approvalId: string }> {
     // Verify JWT signature and expiry
@@ -144,10 +163,16 @@ export class ApprovalGateway extends EventEmitter {
     const field = payload.action === 'approve' ? 'approveToken' : 'rejectToken'
     const record = await prisma.approvalRequest.findFirst({
       where: { [field]: token, status: 'PENDING' },
+      include: { project: { select: { organizationId: true } } },
     })
 
     if (!record) {
       throw new Error('Approval request not found or already resolved')
+    }
+
+    const organizationId = record.project.organizationId
+    if (payload.organizationId !== organizationId || payload.projectId !== record.projectId) {
+      throw new Error('Approval token does not match this approval request')
     }
 
     if (record.expiresAt < new Date()) {
@@ -155,35 +180,90 @@ export class ApprovalGateway extends EventEmitter {
       throw new Error('Approval request has expired')
     }
 
-    // Resolve the approval
+    const userId = await this.authorizeApprover(
+      approver,
+      organizationId,
+      payload.action === 'approve'
+        ? APPROVE_PERMISSION_BY_RISK[record.riskLevel] ?? 'task:approve_critical'
+        : 'approval:reject',
+    )
+
+    // Resolve the approval atomically: only one concurrent caller can move it out of PENDING
     const status = payload.action === 'approve' ? 'APPROVED' : 'REJECTED'
-    await prisma.approvalRequest.update({
-      where: { id: record.id },
+    const now = new Date()
+    const { count } = await prisma.approvalRequest.updateMany({
+      where: { id: record.id, status: 'PENDING', [field]: token, expiresAt: { gt: now } },
       data: {
         status,
-        approvedAt: new Date(),
+        approvedAt: now,
+        approvedById: userId,
         rejectionReason: rejectionReason ?? null,
       },
     })
 
+    if (count !== 1) {
+      throw new Error('Approval request not found or already resolved')
+    }
+
     // Update task status
     await prisma.agentTask.update({
       where: { id: record.taskId },
-      data: { status: payload.action === 'approve' ? 'APPROVED' : 'REJECTED' },
+      data: { status },
     })
 
     log.info(
-      { approvalId: record.id, taskId: record.taskId, action: payload.action, approvedBy },
+      {
+        approvalId: record.id,
+        taskId: record.taskId,
+        action: payload.action,
+        approvedBy: userId,
+        approverName: approver.displayName,
+      },
       'Approval resolved',
     )
 
     if (payload.action === 'approve') {
-      this.emit('approved', record.id, record.taskId, approvedBy)
+      this.emit('approved', record.id, record.taskId, userId)
     } else {
       this.emit('rejected', record.id, record.taskId, rejectionReason)
     }
 
     return { action: payload.action, approvalId: record.id }
+  }
+
+  /**
+   * Map the approver to a Forge member of the organization and require the
+   * given permission. Returns the Forge user ID.
+   */
+  private async authorizeApprover(
+    approver: ApproverIdentity,
+    organizationId: string,
+    permission: string,
+  ): Promise<string> {
+    const user = approver.userId
+      ? await prisma.user.findUnique({ where: { id: approver.userId }, select: { id: true } })
+      : approver.email
+        ? await prisma.user.findFirst({
+            where: { email: { equals: approver.email, mode: 'insensitive' } },
+            select: { id: true },
+          })
+        : null
+
+    if (!user) {
+      log.warn({ approverName: approver.displayName }, 'Approver is not linked to a Forge account')
+      throw new Error('You are not linked to a Forge account')
+    }
+
+    const role = await getUserRole(user.id, organizationId)
+    if (!role || !hasPermission(role, permission)) {
+      log.warn(
+        { userId: user.id, organizationId, permission, role },
+        'Approver lacks permission for approval action',
+      )
+      throw new Error(`You do not have the '${permission}' permission for this approval`)
+    }
+
+    return user.id
   }
 
   /**

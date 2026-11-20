@@ -15,7 +15,7 @@ import type { ButtonAction } from '@slack/bolt';
 import type { KnownBlock } from '@slack/web-api';
 import { createLogger } from '@forge/shared';
 import type { ApprovalNotification } from '@forge/shared';
-import type { ApprovalGateway } from '@forge/orchestrator';
+import type { ApprovalGateway, ApproverIdentity } from '@forge/orchestrator';
 
 const log = createLogger('adapter-slack');
 
@@ -697,7 +697,8 @@ export class SlackAdapter {
       log.info({ userId }, 'Approve button clicked');
 
       try {
-        const result = await this.approvalGateway.processToken(token, username);
+        const approver = await this.resolveApprover(userId, username);
+        const result = await this.approvalGateway.processToken(token, approver);
 
         await respond({
           replace_original: true,
@@ -723,9 +724,10 @@ export class SlackAdapter {
       log.info({ userId }, 'Reject button clicked');
 
       try {
+        const approver = await this.resolveApprover(userId, username);
         const result = await this.approvalGateway.processToken(
           token,
-          username,
+          approver,
           `Rejected via Slack by ${username}`,
         );
 
@@ -741,6 +743,19 @@ export class SlackAdapter {
         await respond({ replace_original: false, text: `❌ Failed to process rejection: ${msg}` });
       }
     });
+  }
+
+  /**
+   * Map a Slack user to a Forge approver via their Slack profile email.
+   * Requires the `users:read.email` bot scope.
+   */
+  private async resolveApprover(userId: string, username: string): Promise<ApproverIdentity> {
+    const info = await this.app.client.users.info({ user: userId });
+    const email = info.user?.profile?.email;
+    if (!email) {
+      throw new Error('Could not resolve your Slack email to a Forge account');
+    }
+    return { email, displayName: username };
   }
 
   // -- Extension Point -----------------------------------------------------
