@@ -1,5 +1,6 @@
 /**
  * Auth routes — organization creation, API key management
+ * All routes require an authenticated caller (see ../auth.ts).
  */
 
 import type { FastifyInstance } from 'fastify'
@@ -8,12 +9,12 @@ import { prisma } from '@forge/database'
 import { createLogger } from '@forge/shared'
 import { generateApiKey, hashApiKey } from '@forge/shared'
 import { createOrganization } from '@forge/auth'
+import { HttpError, getCallerRole, requireCaller, requireOrgPermission, requireUser } from '../auth.js'
 
 const log = createLogger('routes:auth')
 
 const CreateOrgSchema = z.object({
   name: z.string().min(1).max(100),
-  userId: z.string().uuid(),
 })
 
 const CreateApiKeySchema = z.object({
@@ -26,13 +27,14 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
 
   // Create organization (called after user signs up)
   app.post('/api/organizations', async (request, reply) => {
+    const caller = requireUser(request)
     const body = CreateOrgSchema.safeParse(request.body)
     if (!body.success) {
       return reply.status(400).send({ error: body.error.flatten() })
     }
 
     try {
-      const result = await createOrganization(body.data)
+      const result = await createOrganization({ name: body.data.name, userId: caller.userId })
       return reply.status(201).send(result)
     } catch (err) {
       log.error({ error: (err as Error).message }, 'Failed to create organization')
@@ -40,15 +42,28 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
     }
   })
 
-  // List organizations for a user
+  // List organizations for the authenticated caller
   app.get('/api/organizations', async (request, reply) => {
+    const caller = requireCaller(request)
     const query = request.query as { userId?: string }
-    if (!query.userId) {
-      return reply.status(400).send({ error: 'userId required' })
+    if (query.userId && query.userId !== caller.userId) {
+      return reply.status(403).send({ error: 'Forbidden' })
+    }
+
+    if (caller.type === 'api-key' && caller.organizationId) {
+      const organization = await prisma.organization.findUnique({
+        where: { id: caller.organizationId },
+        select: { id: true, name: true, slug: true, planTier: true, createdAt: true },
+      })
+      const role = await getCallerRole(caller, caller.organizationId)
+      return organization ? [{ ...organization, role }] : []
     }
 
     const memberships = await prisma.orgMember.findMany({
-      where: { userId: query.userId },
+      where: {
+        userId: caller.userId ?? '',
+        ...(caller.organizationId ? { organizationId: caller.organizationId } : {}),
+      },
       include: {
         organization: {
           select: {
@@ -70,6 +85,9 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
     if (!body.success) {
       return reply.status(400).send({ error: body.error.flatten() })
     }
+
+    requireUser(request)
+    await requireOrgPermission(request, body.data.organizationId, 'credential:manage')
 
     const { key, prefix, hash } = generateApiKey()
 
@@ -106,6 +124,8 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(400).send({ error: 'organizationId required' })
     }
 
+    await requireOrgPermission(request, query.organizationId, 'credential:manage')
+
     const keys = await prisma.apiKey.findMany({
       where: { organizationId: query.organizationId, revokedAt: null },
       select: {
@@ -120,9 +140,17 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
   // Revoke an API key
   app.delete('/api/api-keys/:keyId', async (request, reply) => {
     const { keyId } = request.params as { keyId: string }
+    requireUser(request)
 
-    await prisma.apiKey.update({
-      where: { id: keyId },
+    const apiKey = z.string().uuid().safeParse(keyId).success
+      ? await prisma.apiKey.findUnique({ where: { id: keyId }, select: { organizationId: true } })
+      : null
+    if (!apiKey) throw new HttpError(404, 'API key not found')
+
+    await requireOrgPermission(request, apiKey.organizationId, 'credential:manage')
+
+    await prisma.apiKey.updateMany({
+      where: { id: keyId, organizationId: apiKey.organizationId, revokedAt: null },
       data: { revokedAt: new Date() },
     })
 
@@ -141,6 +169,9 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(400).send({ error: body.error.flatten() })
     }
 
+    requireUser(request)
+    await requireOrgPermission(request, orgId, 'org:manage_members')
+
     const invitation = await prisma.orgInvitation.create({
       data: {
         organizationId: orgId,
@@ -152,10 +183,12 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
 
     log.info({ orgId, email: body.data.email, role: body.data.role }, 'Invitation created')
 
-    // In production: send invitation email here
+    // The invitation token is delivered to the invitee by email only, never in the API response
     return reply.status(201).send({
       invitationId: invitation.id,
-      token: invitation.token,
+      email: invitation.email,
+      role: invitation.role,
+      expiresAt: invitation.expiresAt,
     })
   })
 }
