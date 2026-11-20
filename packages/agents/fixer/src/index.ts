@@ -28,6 +28,7 @@ import {
   assertSandboxAvailable,
   installSandboxDependencies,
   runInSandbox,
+  SandboxUnavailableError,
 } from '@forge/shared'
 import type { AgentTask, ConfidenceScore, FixPattern, RiskLevel } from '@forge/shared'
 import { prisma } from '@forge/database'
@@ -582,6 +583,7 @@ export class FixerAgent {
 
       // Run regression tests to verify the pattern still works
       let regressionPassed = false
+      let sandboxUnavailable = false
       let coverage: number | undefined
       try {
         const testOutput = runRegressionTests(workDir)
@@ -589,11 +591,12 @@ export class FixerAgent {
         const coverageMatch = testOutput.match(/Lines\s*:\s*([\d.]+)%/)
         if (coverageMatch?.[1]) coverage = parseFloat(coverageMatch[1])
       } catch (err) {
+        if (err instanceof SandboxUnavailableError) sandboxUnavailable = true
         taskLog.warn({ err }, 'Regression tests failed for known pattern')
       }
 
-      // Record the outcome
-      await this.recordFixOutcome(
+      // Record the outcome (skipped when tests never ran, so pattern stats stay accurate)
+      if (!sandboxUnavailable) await this.recordFixOutcome(
         {
           errorFingerprint: pattern.errorFingerprint,
           errorDescription: pattern.errorDescription,
@@ -731,6 +734,7 @@ export class FixerAgent {
 
       // Run regression tests
       let regressionPassed = false
+      let sandboxUnavailable = false
       let coverage: number | undefined
       const regressionErrors: string[] = []
       try {
@@ -739,6 +743,7 @@ export class FixerAgent {
         const coverageMatch = testOutput.match(/Lines\s*:\s*([\d.]+)%/)
         if (coverageMatch?.[1]) coverage = parseFloat(coverageMatch[1])
       } catch (err) {
+        if (err instanceof SandboxUnavailableError) sandboxUnavailable = true
         regressionErrors.push(String(err).slice(0, 500))
         taskLog.warn({ err }, 'Regression tests failed')
       }
@@ -757,8 +762,8 @@ export class FixerAgent {
         taskLog.warn({ err }, 'Confidence engine failed')
       }
 
-      // Record the fix outcome for future pattern matching
-      await this.recordFixOutcome(
+      // Record the fix outcome for future pattern matching (skipped when tests never ran)
+      if (!sandboxUnavailable) await this.recordFixOutcome(
         {
           errorFingerprint: classification.fingerprint,
           errorDescription: payload.errorMessage,
