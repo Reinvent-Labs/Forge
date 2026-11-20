@@ -1,23 +1,29 @@
 import { NextResponse } from 'next/server'
-import { getServerSession } from '@/lib/auth'
 import { prisma } from '@/lib/prisma'
+import { requireProjectMember } from '@/lib/project-access'
 
 /**
  * GET /api/projects/[id]/integrations
- * Returns all ProjectIntegration rows for the given project.
+ * Returns the ProjectIntegration rows for the given project, without their config.
  */
 export async function GET(
   _request: Request,
   { params }: { params: { id: string } }
 ) {
   try {
-    const session = await getServerSession()
-    if (!session?.user?.id) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
+    const access = await requireProjectMember(params.id)
+    if (!access.ok) return access.response
+    const projectId = access.project.id
 
     const integrations = await prisma.projectIntegration.findMany({
-      where: { projectId: params.id },
+      where: { projectId },
+      select: {
+        id: true,
+        type: true,
+        status: true,
+        lastSyncAt: true,
+        createdAt: true,
+      },
       orderBy: { createdAt: 'asc' },
     })
 

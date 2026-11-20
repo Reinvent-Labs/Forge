@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server'
-import { getServerSession } from '@/lib/auth'
 import { prisma } from '@/lib/prisma'
-import type { AgentType } from '@prisma/client'
+import { requireProjectMember } from '@/lib/project-access'
+import { AgentType } from '@prisma/client'
 
 /**
  * GET /api/projects/[id]/activity
@@ -17,10 +17,9 @@ export async function GET(
   { params }: { params: { id: string } }
 ) {
   try {
-    const session = await getServerSession()
-    if (!session?.user?.id) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
+    const access = await requireProjectMember(params.id)
+    if (!access.ok) return access.response
+    const projectId = access.project.id
 
     const { searchParams } = new URL(request.url)
     const page = Math.max(1, parseInt(searchParams.get('page') ?? '1', 10))
@@ -28,16 +27,32 @@ export async function GET(
     const agentTypeParam = searchParams.get('agentType')
 
     // Build the where clause, optionally filtering by agentType
+    const agentType = agentTypeParam?.toUpperCase()
+    if (agentType && !(Object.values(AgentType) as string[]).includes(agentType)) {
+      return NextResponse.json({ error: 'Invalid agentType' }, { status: 400 })
+    }
+
     const where = {
-      projectId: params.id,
-      ...(agentTypeParam
-        ? { agentType: agentTypeParam.toUpperCase() as AgentType }
-        : {}),
+      projectId,
+      ...(agentType ? { agentType: agentType as AgentType } : {}),
     }
 
     const [tasks, total] = await Promise.all([
       prisma.agentTask.findMany({
         where,
+        select: {
+          id: true,
+          projectId: true,
+          type: true,
+          agentType: true,
+          status: true,
+          payload: true,
+          prUrl: true,
+          prNumber: true,
+          createdAt: true,
+          completedAt: true,
+          durationMs: true,
+        },
         orderBy: { createdAt: 'desc' },
         skip: (page - 1) * limit,
         take: limit,
