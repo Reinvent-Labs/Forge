@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
-import { getServerSession } from '@/lib/auth'
 import { prisma } from '@/lib/prisma'
+import { requireProjectMember } from '@/lib/project-access'
 import type { ApprovalStatus } from '@prisma/client'
 
 /**
@@ -15,10 +15,9 @@ export async function GET(
   { params }: { params: { id: string } }
 ) {
   try {
-    const session = await getServerSession()
-    if (!session?.user?.id) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
+    const access = await requireProjectMember(params.id)
+    if (!access.ok) return access.response
+    const projectId = access.project.id
 
     const { searchParams } = new URL(request.url)
     const statusParam = searchParams.get('status')
@@ -38,11 +37,11 @@ export async function GET(
 
     const approvals = await prisma.approvalRequest.findMany({
       where: {
-        projectId: params.id,
+        projectId,
         status: approvalStatus,
       },
       include: {
-        task: true,
+        task: { select: { prUrl: true } },
       },
       orderBy: { createdAt: 'desc' },
     })

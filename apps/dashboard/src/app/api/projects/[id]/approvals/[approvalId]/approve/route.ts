@@ -1,32 +1,62 @@
 import { NextResponse } from 'next/server'
-import { getServerSession } from '@/lib/auth'
 import { prisma } from '@/lib/prisma'
+import {
+  approvalPermissions,
+  isUuid,
+  notFound,
+  requireProjectMember,
+  requireProjectPermissions,
+} from '@/lib/project-access'
 
 /**
  * POST /api/projects/[id]/approvals/[approvalId]/approve
  * Marks the given approval request as APPROVED.
+ * Only pending, unexpired requests can be approved, and the caller needs
+ * approval:approve plus the task:approve_<risk> permission for the request's risk level.
  */
 export async function POST(
   _request: Request,
   { params }: { params: { id: string; approvalId: string } }
 ) {
   try {
-    const session = await getServerSession()
-    if (!session?.user?.id) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
+    const access = await requireProjectMember(params.id)
+    if (!access.ok) return access.response
+    const projectId = access.project.id
 
-    const updated = await prisma.approvalRequest.update({
+    if (!isUuid(params.approvalId)) return notFound()
+
+    const approval = await prisma.approvalRequest.findFirst({
+      where: { id: params.approvalId, projectId },
+      select: { id: true, riskLevel: true },
+    })
+    if (!approval) return notFound()
+
+    const denied = await requireProjectPermissions(
+      access,
+      approvalPermissions('approval:approve', approval.riskLevel),
+    )
+    if (denied) return denied
+
+    const now = new Date()
+    const { count } = await prisma.approvalRequest.updateMany({
       where: {
-        id: params.approvalId,
-        projectId: params.id,
+        id: approval.id,
+        projectId,
+        riskLevel: approval.riskLevel,
+        status: 'PENDING',
+        expiresAt: { gt: now },
       },
       data: {
         status: 'APPROVED',
-        approvedAt: new Date(),
-        approvedById: session.user.id,
+        approvedAt: now,
+        approvedById: access.userId,
       },
-      include: { task: true },
+    })
+    if (count === 0) return notFound()
+
+    const updated = await prisma.approvalRequest.findUniqueOrThrow({
+      where: { id: approval.id },
+      include: { task: { select: { prUrl: true } } },
     })
 
     const cs = updated.confidenceScore as {

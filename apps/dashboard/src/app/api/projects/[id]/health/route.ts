@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
-import { getServerSession } from '@/lib/auth'
 import { prisma } from '@/lib/prisma'
+import { requireProjectMember } from '@/lib/project-access'
 
 /**
  * Compute a letter grade from a numeric score (0–100).
@@ -29,10 +29,9 @@ export async function GET(
   { params }: { params: { id: string } }
 ) {
   try {
-    const session = await getServerSession()
-    if (!session?.user?.id) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
+    const access = await requireProjectMember(params.id)
+    if (!access.ok) return access.response
+    const projectId = access.project.id
 
     const thirtyDaysAgo = new Date()
     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30)
@@ -42,14 +41,14 @@ export async function GET(
       await Promise.all([
         // Most recent metrics snapshot
         prisma.projectMetricsSnapshot.findFirst({
-          where: { projectId: params.id },
+          where: { projectId },
           orderBy: { capturedAt: 'desc' },
         }),
 
         // All incidents in the last 30 days
         prisma.incident.findMany({
           where: {
-            projectId: params.id,
+            projectId,
             detectedAt: { gte: thirtyDaysAgo },
           },
           select: { severity: true, status: true },
@@ -58,7 +57,7 @@ export async function GET(
         // Most recent security scan
         prisma.securityScan.findFirst({
           where: {
-            projectId: params.id,
+            projectId,
             status: 'COMPLETED',
           },
           orderBy: { completedAt: 'desc' },
@@ -68,7 +67,7 @@ export async function GET(
         prisma.debtItem.groupBy({
           by: ['severity'],
           where: {
-            projectId: params.id,
+            projectId,
             resolvedAt: null,
           },
           _count: { id: true },
