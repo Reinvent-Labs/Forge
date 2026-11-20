@@ -149,8 +149,9 @@ async function start(): Promise<void> {
       return reply.status(400).send({ error: 'Invalid or expired approval token' })
     }
 
-    const approval = await prisma.approvalRequest.findUnique({
-      where: { id: tokenPayload.approvalId },
+    const tokenField = tokenPayload.action === 'approve' ? 'approveToken' : 'rejectToken'
+    const approval = await prisma.approvalRequest.findFirst({
+      where: { [tokenField]: query.token },
       select: { projectId: true, riskLevel: true },
     })
     if (!approval) {
