@@ -121,4 +121,18 @@ describe('buildSandboxArgs', () => {
       expect(args[args.indexOf(`${key}=`) - 1]).toBe('--env')
     }
   })
+
+  it('passes FORGE_SANDBOX_INSTALL_PROXY only to network-enabled installs', () => {
+    process.env['FORGE_SANDBOX_INSTALL_PROXY'] = 'http://proxy.internal:3128'
+    try {
+      const install = buildSandboxArgs(workDir, ['npm', 'ci', '--ignore-scripts'], 'n', { network: true })
+      expect(install).toContain('HTTPS_PROXY=http://proxy.internal:3128')
+      expect(install).toContain('NO_PROXY=')
+      const check = buildSandboxArgs(workDir, ['npx', '--no-install', 'jest'], 'n')
+      expect(check).toContain('HTTPS_PROXY=')
+      expect(check.join(' ')).not.toContain('proxy.internal')
+    } finally {
+      delete process.env['FORGE_SANDBOX_INSTALL_PROXY']
+    }
+  })
 })

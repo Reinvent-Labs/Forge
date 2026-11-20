@@ -185,9 +185,14 @@ export function buildSandboxArgs(workDir: string, command: string[], name: strin
     '--env', 'npm_config_audit=false',
     '--env', 'npm_config_fund=false',
   ]
-  // Explicit empty values stop the Docker CLI from injecting proxy URLs (and
-  // any credentials in them) from the host's ~/.docker/config.json.
-  for (const key of PROXY_ENV_KEYS) args.push('--env', `${key}=`)
+  // Explicit values stop the Docker CLI from injecting proxy URLs (and any
+  // credentials in them) from the host's ~/.docker/config.json. Installs may
+  // use an operator-chosen proxy; script-running steps never get one.
+  const installProxy = options.network ? process.env['FORGE_SANDBOX_INSTALL_PROXY'] ?? '' : ''
+  for (const key of PROXY_ENV_KEYS) {
+    const isProxyUrl = !key.toLowerCase().startsWith('no_')
+    args.push('--env', `${key}=${isProxyUrl ? installProxy : ''}`)
+  }
   const uid = process.getuid?.()
   const gid = process.getgid?.()
   if (uid !== undefined && gid !== undefined) args.push('--user', `${uid}:${gid}`)
