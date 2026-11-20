@@ -7,6 +7,10 @@
 #   VERCEL_TOKEN             — Vercel personal access token (Account Settings → Tokens)
 #   VERCEL_ORG_ID            — Found in Vercel project settings (e.g. team_xxxx)
 #   VERCEL_PROJECT_ID_DASHBOARD — The Vercel project ID for the dashboard app
+#
+# Required Vercel production environment variables (checked before deploying):
+#   NEXTAUTH_SECRET          — 32+ random chars (`openssl rand -base64 32`).
+#                              The dashboard refuses to start without it.
 
 name: Deploy Dashboard
 
@@ -78,6 +82,22 @@ jobs:
       - name: Pull Vercel project settings
         working-directory: apps/dashboard
         run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+        env:
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID_DASHBOARD }}
+
+      # Fail the deploy if the production environment is missing a required
+      # secret, instead of shipping a dashboard that refuses to start.
+      - name: Verify required Vercel environment variables
+        working-directory: apps/dashboard
+        run: |
+          ENV_LIST=$(vercel env ls production --token=${{ secrets.VERCEL_TOKEN }})
+          for name in NEXTAUTH_SECRET; do
+            if ! grep -qw "$name" <<< "$ENV_LIST"; then
+              echo "::error::$name is not set in the Vercel production environment"
+              exit 1
+            fi
+          done
         env:
           VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
           VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID_DASHBOARD }}

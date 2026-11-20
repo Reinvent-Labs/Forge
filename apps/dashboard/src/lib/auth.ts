@@ -10,9 +10,11 @@
  */
 
 import { NextAuthOptions, getServerSession as _getServerSession } from "next-auth"
+import { PHASE_PRODUCTION_BUILD } from "next/constants"
 import CredentialsProvider from "next-auth/providers/credentials"
 import { PrismaClient } from "@prisma/client"
 import bcrypt from "bcryptjs"
+import { getNextAuthSecret } from "@/lib/nextauth-secret"
 
 // ---------------------------------------------------------------------------
 // Prisma singleton — avoids spawning a new connection on every hot-reload
@@ -49,8 +51,11 @@ export const authOptions: NextAuthOptions = {
     strategy: "jwt",
   },
 
-  secret:
-    process.env.NEXTAUTH_SECRET ?? "forge-dev-secret-change-in-production",
+  // Skipped only while `next build` collects page data; every runtime import
+  // (dev, start, serverless) throws if the secret is missing or too short.
+  ...(process.env.NEXT_PHASE === PHASE_PRODUCTION_BUILD
+    ? {}
+    : { secret: getNextAuthSecret() }),
 
   pages: {
     signIn: "/login",
