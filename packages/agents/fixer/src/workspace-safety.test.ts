@@ -10,6 +10,7 @@ import * as path from 'path'
 import {
   applyWorkspaceFileChanges,
   buildSandboxArgs,
+  sandboxCliEnv,
   resolveWorkspacePath,
   UnsafeWorkspacePathError,
 } from '@forge/shared'
@@ -126,11 +127,14 @@ describe('buildSandboxArgs', () => {
     process.env['FORGE_SANDBOX_INSTALL_PROXY'] = 'http://proxy.internal:3128'
     try {
       const install = buildSandboxArgs(workDir, ['npm', 'ci', '--ignore-scripts'], 'n', { network: true })
-      expect(install).toContain('HTTPS_PROXY=http://proxy.internal:3128')
+      expect(install[install.indexOf('HTTPS_PROXY') - 1]).toBe('--env')
       expect(install).toContain('NO_PROXY=')
+      expect(install.join(' ')).not.toContain('proxy.internal')
+      expect(sandboxCliEnv({ network: true })['HTTPS_PROXY']).toBe('http://proxy.internal:3128')
       const check = buildSandboxArgs(workDir, ['npx', '--no-install', 'jest'], 'n')
       expect(check).toContain('HTTPS_PROXY=')
       expect(check.join(' ')).not.toContain('proxy.internal')
+      expect(sandboxCliEnv()['HTTPS_PROXY']).toBeUndefined()
     } finally {
       delete process.env['FORGE_SANDBOX_INSTALL_PROXY']
     }

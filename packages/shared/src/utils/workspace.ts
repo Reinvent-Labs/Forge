@@ -148,6 +148,29 @@ function runtimeCliEnv(): NodeJS.ProcessEnv {
   return env
 }
 
+function isProxyUrlKey(key: string): boolean {
+  return !key.toLowerCase().startsWith('no_')
+}
+
+function installProxy(options: SandboxOptions): string | undefined {
+  const proxy = process.env['FORGE_SANDBOX_INSTALL_PROXY']
+  return options.network && proxy ? proxy : undefined
+}
+
+/**
+ * Env for the runtime CLI when launching a sandbox. Only the install proxy is
+ * added (for name-only `--env` forwarding); NO_PROXY=* keeps the CLI's own
+ * daemon connection off that proxy.
+ */
+export function sandboxCliEnv(options: SandboxOptions = {}): NodeJS.ProcessEnv {
+  const env = runtimeCliEnv()
+  const proxy = installProxy(options)
+  if (proxy !== undefined) {
+    for (const key of PROXY_ENV_KEYS) env[key] = isProxyUrlKey(key) ? proxy : '*'
+  }
+  return env
+}
+
 /** Throws SandboxUnavailableError when the container runtime cannot be reached. */
 export function assertSandboxAvailable(): void {
   try {
@@ -188,10 +211,11 @@ export function buildSandboxArgs(workDir: string, command: string[], name: strin
   // Explicit values stop the Docker CLI from injecting proxy URLs (and any
   // credentials in them) from the host's ~/.docker/config.json. Installs may
   // use an operator-chosen proxy; script-running steps never get one.
-  const installProxy = options.network ? process.env['FORGE_SANDBOX_INSTALL_PROXY'] ?? '' : ''
+  // The proxy URL is passed by name only (value comes from sandboxCliEnv) so
+  // credentials in it never appear in argv or in exec error messages.
+  const useInstallProxy = installProxy(options) !== undefined
   for (const key of PROXY_ENV_KEYS) {
-    const isProxyUrl = !key.toLowerCase().startsWith('no_')
-    args.push('--env', `${key}=${isProxyUrl ? installProxy : ''}`)
+    args.push('--env', useInstallProxy && isProxyUrlKey(key) ? key : `${key}=`)
   }
   const uid = process.getuid?.()
   const gid = process.getgid?.()
@@ -210,7 +234,7 @@ export function runInSandbox(workDir: string, command: string[], options: Sandbo
   const args = buildSandboxArgs(workDir, command, name, options)
   try {
     return execFileSync(sandboxRuntime(), args, {
-      env: runtimeCliEnv(),
+      env: sandboxCliEnv(options),
       stdio: 'pipe',
       timeout: options.timeoutMs ?? 120_000,
       maxBuffer: 16 * 1024 * 1024,
