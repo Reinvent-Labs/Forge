@@ -44,7 +44,8 @@ const SESSION_COOKIES = [
   'next-auth.session-token',
 ] as const
 
-const NEXT_AUTH_SALTS = ['__Secure-next-auth.session-token', 'next-auth.session-token'] as const
+// NextAuth v4 encodes session JWTs with an empty salt; v5 uses the cookie name
+const NEXT_AUTH_SALTS = ['', '__Secure-next-auth.session-token', 'next-auth.session-token'] as const
 
 const UuidSchema = z.string().uuid()
 
