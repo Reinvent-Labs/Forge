@@ -19,11 +19,16 @@
 
 import Anthropic from 'anthropic'
 import { Octokit } from 'octokit'
-import { execSync } from 'child_process'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
-import { createLogger } from '@forge/shared'
+import {
+  createLogger,
+  applyWorkspaceFileChanges,
+  assertSandboxAvailable,
+  installSandboxDependencies,
+  runInSandbox,
+} from '@forge/shared'
 import type { AgentTask, ConfidenceScore, FixPattern, RiskLevel } from '@forge/shared'
 import { prisma } from '@forge/database'
 import { ConfidenceEngine } from '@forge/orchestrator'
@@ -572,17 +577,14 @@ export class FixerAgent {
       }
 
       if (fileChanges.length > 0) {
-        applyFileChanges(workDir, fileChanges)
+        applyWorkspaceFileChanges(workDir, fileChanges)
       }
 
       // Run regression tests to verify the pattern still works
       let regressionPassed = false
       let coverage: number | undefined
       try {
-        const testOutput = execSync(
-          'npx jest --passWithNoTests',
-          { cwd: workDir, stdio: 'pipe', timeout: 120_000 },
-        ).toString()
+        const testOutput = runRegressionTests(workDir)
         regressionPassed = true
         const coverageMatch = testOutput.match(/Lines\s*:\s*([\d.]+)%/)
         if (coverageMatch?.[1]) coverage = parseFloat(coverageMatch[1])
@@ -725,17 +727,14 @@ export class FixerAgent {
 
     const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-fixer-'))
     try {
-      applyFileChanges(workDir, fileChanges)
+      applyWorkspaceFileChanges(workDir, fileChanges)
 
       // Run regression tests
       let regressionPassed = false
       let coverage: number | undefined
       const regressionErrors: string[] = []
       try {
-        const testOutput = execSync(
-          'npx jest --passWithNoTests',
-          { cwd: workDir, stdio: 'pipe', timeout: 120_000 },
-        ).toString()
+        const testOutput = runRegressionTests(workDir)
         regressionPassed = true
         const coverageMatch = testOutput.match(/Lines\s*:\s*([\d.]+)%/)
         if (coverageMatch?.[1]) coverage = parseFloat(coverageMatch[1])
@@ -1018,17 +1017,16 @@ function buildFixPrBody(opts: FixPrBodyOptions): string {
 // File-system helpers
 // ---------------------------------------------------------------------------
 
-function applyFileChanges(workDir: string, changes: FileChange[]): void {
-  for (const change of changes) {
-    const fullPath = path.join(workDir, change.filePath)
-    const dir = path.dirname(fullPath)
-    if (change.action === 'delete') {
-      try { fs.unlinkSync(fullPath) } catch { /* may not exist */ }
-      continue
-    }
-    fs.mkdirSync(dir, { recursive: true })
-    fs.writeFileSync(fullPath, change.content, 'utf-8')
-  }
+/**
+ * Run the regression suite for generated fix code. Generated tests and jest
+ * configs are untrusted, so they only run in the sandbox (no host env, no
+ * network, lifecycle scripts disabled). Throws if the suite fails or the
+ * sandbox is unavailable.
+ */
+function runRegressionTests(workDir: string): string {
+  assertSandboxAvailable()
+  installSandboxDependencies(workDir)
+  return runInSandbox(workDir, ['npx', '--no-install', 'jest', '--passWithNoTests'], { timeoutMs: 120_000 })
 }
 
 // ---------------------------------------------------------------------------
