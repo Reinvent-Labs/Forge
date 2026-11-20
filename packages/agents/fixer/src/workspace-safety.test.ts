@@ -114,4 +114,11 @@ describe('buildSandboxArgs', () => {
     const args = buildSandboxArgs(workDir, ['npm', 'ci', '--ignore-scripts'], 'n', { network: true })
     expect(args[args.indexOf('--network') + 1]).toBe('bridge')
   })
+
+  it('blanks proxy env so Docker client config cannot inject proxy credentials', () => {
+    const args = buildSandboxArgs(workDir, ['npm', 'ci', '--ignore-scripts'], 'n', { network: true })
+    for (const key of ['HTTP_PROXY', 'https_proxy', 'NO_PROXY', 'all_proxy']) {
+      expect(args[args.indexOf(`${key}=`) - 1]).toBe('--env')
+    }
+  })
 })

@@ -122,6 +122,14 @@ export interface SandboxOptions {
 
 const SANDBOX_WORKDIR = '/workspace'
 
+const PROXY_ENV_KEYS = [
+  'HTTP_PROXY', 'http_proxy',
+  'HTTPS_PROXY', 'https_proxy',
+  'FTP_PROXY', 'ftp_proxy',
+  'NO_PROXY', 'no_proxy',
+  'ALL_PROXY', 'all_proxy',
+]
+
 function sandboxRuntime(): string {
   return process.env['FORGE_SANDBOX_RUNTIME'] ?? 'docker'
 }
@@ -177,6 +185,9 @@ export function buildSandboxArgs(workDir: string, command: string[], name: strin
     '--env', 'npm_config_audit=false',
     '--env', 'npm_config_fund=false',
   ]
+  // Explicit empty values stop the Docker CLI from injecting proxy URLs (and
+  // any credentials in them) from the host's ~/.docker/config.json.
+  for (const key of PROXY_ENV_KEYS) args.push('--env', `${key}=`)
   const uid = process.getuid?.()
   const gid = process.getgid?.()
   if (uid !== undefined && gid !== undefined) args.push('--user', `${uid}:${gid}`)
