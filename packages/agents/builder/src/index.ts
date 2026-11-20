@@ -16,11 +16,17 @@
 
 import Anthropic from '@anthropic-ai/sdk'
 import { Octokit } from 'octokit'
-import { execSync } from 'child_process'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
-import { createLogger } from '@forge/shared'
+import {
+  createLogger,
+  applyWorkspaceFileChanges,
+  assertSandboxAvailable,
+  installSandboxDependencies,
+  resolveWorkspacePath,
+  runInSandbox,
+} from '@forge/shared'
 import type { AgentTask, ConfidenceScore } from '@forge/shared'
 import { prisma } from '@forge/database'
 import { ConfidenceEngine } from '@forge/orchestrator'
@@ -258,7 +264,7 @@ export class BuilderAgent {
     // 3. Apply changes to a temp directory and run quality checks
     const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-builder-'))
     try {
-      applyFileChanges(workDir, fileChanges)
+      applyWorkspaceFileChanges(workDir, fileChanges)
 
       let checks: CheckResult
       try {
@@ -414,7 +420,7 @@ export class BuilderAgent {
 
     const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-tests-'))
     try {
-      applyFileChanges(workDir, fileChanges)
+      applyWorkspaceFileChanges(workDir, fileChanges)
 
       let checks: CheckResult
       try {
@@ -607,7 +613,7 @@ export class BuilderAgent {
 
     const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-refactor-'))
     try {
-      applyFileChanges(workDir, fileChanges)
+      applyWorkspaceFileChanges(workDir, fileChanges)
 
       let checks: CheckResult
       try {
@@ -770,18 +776,24 @@ export class BuilderAgent {
     let testsPassed = false
     let coverage: number | undefined
 
-    // Install dependencies (use ci if lockfile present for reproducibility)
+    // Generated code (package.json, configs, tests) only ever runs in the sandbox.
     try {
-      const hasLock = fs.existsSync(path.join(workDir, 'package-lock.json'))
-      const installCmd = hasLock ? 'npm ci --silent' : 'npm install --silent'
-      execSync(installCmd, { cwd: workDir, stdio: 'pipe', timeout: 120_000 })
+      assertSandboxAvailable()
+    } catch (err) {
+      errors.push(String(err).slice(0, 500))
+      return { passed: false, lintPassed, typecheckPassed, testsPassed, errors }
+    }
+
+    // Install dependencies with lifecycle scripts disabled
+    try {
+      installSandboxDependencies(workDir)
     } catch (err) {
       errors.push(`Dependency install warning: ${String(err).slice(0, 200)}`)
     }
 
     // ESLint — treat any warning as an error to keep the standard high
     try {
-      execSync('npx eslint . --max-warnings 0', { cwd: workDir, stdio: 'pipe', timeout: 60_000 })
+      runInSandbox(workDir, ['npx', '--no-install', 'eslint', '.', '--max-warnings', '0'], { timeoutMs: 60_000 })
       lintPassed = true
     } catch (err) {
       errors.push(`Lint: ${String(err).slice(0, 500)}`)
@@ -789,7 +801,7 @@ export class BuilderAgent {
 
     // TypeScript strict typecheck (no emit)
     try {
-      execSync('npx tsc --noEmit', { cwd: workDir, stdio: 'pipe', timeout: 60_000 })
+      runInSandbox(workDir, ['npx', '--no-install', 'tsc', '--noEmit'], { timeoutMs: 60_000 })
       typecheckPassed = true
     } catch (err) {
       errors.push(`Typecheck: ${String(err).slice(0, 500)}`)
@@ -797,10 +809,11 @@ export class BuilderAgent {
 
     // Jest with JSON coverage summary for accurate coverage parsing
     try {
-      const testOutput = execSync(
-        'npx jest --coverage --coverageReporters=json-summary --passWithNoTests',
-        { cwd: workDir, stdio: 'pipe', timeout: 120_000 },
-      ).toString()
+      const testOutput = runInSandbox(
+        workDir,
+        ['npx', '--no-install', 'jest', '--coverage', '--coverageReporters=json-summary', '--passWithNoTests'],
+        { timeoutMs: 120_000 },
+      )
       testsPassed = true
       // Parse coverage from Jest text output (quick fallback)
       const coverageMatch = testOutput.match(/Lines\s*:\s*([\d.]+)%/)
@@ -814,7 +827,7 @@ export class BuilderAgent {
     // Read JSON coverage summary if Jest wrote it (more reliable than text parsing)
     if (coverage === undefined) {
       try {
-        const summaryPath = path.join(workDir, 'coverage', 'coverage-summary.json')
+        const summaryPath = resolveWorkspacePath(workDir, 'coverage/coverage-summary.json')
         if (fs.existsSync(summaryPath)) {
           const raw = JSON.parse(fs.readFileSync(summaryPath, 'utf-8')) as Record<
             string,
@@ -1031,28 +1044,6 @@ function extractSection(response: string, sectionName: string): string | undefin
 // ---------------------------------------------------------------------------
 // File-system helpers
 // ---------------------------------------------------------------------------
-
-/**
- * Write parsed file changes into the given working directory.
- *
- * Creates parent directories as needed.
- * Files whose action is 'delete' are removed; non-existent deletes are no-ops.
- *
- * @param workDir - Absolute path to the working directory
- * @param changes - Parsed file changes to apply
- */
-function applyFileChanges(workDir: string, changes: FileChange[]): void {
-  for (const change of changes) {
-    const fullPath = path.join(workDir, change.filePath)
-    const dir = path.dirname(fullPath)
-    if (change.action === 'delete') {
-      try { fs.unlinkSync(fullPath) } catch { /* file may not exist */ }
-      continue
-    }
-    fs.mkdirSync(dir, { recursive: true })
-    fs.writeFileSync(fullPath, change.content, 'utf-8')
-  }
-}
 
 // ---------------------------------------------------------------------------
 // PR body builder

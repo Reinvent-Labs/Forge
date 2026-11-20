@@ -19,11 +19,17 @@
 
 import Anthropic from 'anthropic'
 import { Octokit } from 'octokit'
-import { execSync } from 'child_process'
 import * as fs from 'fs'
 import * as path from 'path'
 import * as os from 'os'
-import { createLogger } from '@forge/shared'
+import {
+  createLogger,
+  applyWorkspaceFileChanges,
+  assertSandboxAvailable,
+  installSandboxDependencies,
+  runInSandbox,
+  SandboxUnavailableError,
+} from '@forge/shared'
 import type { AgentTask, ConfidenceScore, FixPattern, RiskLevel } from '@forge/shared'
 import { prisma } from '@forge/database'
 import { ConfidenceEngine } from '@forge/orchestrator'
@@ -572,26 +578,25 @@ export class FixerAgent {
       }
 
       if (fileChanges.length > 0) {
-        applyFileChanges(workDir, fileChanges)
+        applyWorkspaceFileChanges(workDir, fileChanges)
       }
 
       // Run regression tests to verify the pattern still works
       let regressionPassed = false
+      let sandboxUnavailable = false
       let coverage: number | undefined
       try {
-        const testOutput = execSync(
-          'npx jest --passWithNoTests',
-          { cwd: workDir, stdio: 'pipe', timeout: 120_000 },
-        ).toString()
+        const testOutput = runRegressionTests(workDir)
         regressionPassed = true
         const coverageMatch = testOutput.match(/Lines\s*:\s*([\d.]+)%/)
         if (coverageMatch?.[1]) coverage = parseFloat(coverageMatch[1])
       } catch (err) {
+        if (err instanceof SandboxUnavailableError) sandboxUnavailable = true
         taskLog.warn({ err }, 'Regression tests failed for known pattern')
       }
 
-      // Record the outcome
-      await this.recordFixOutcome(
+      // Record the outcome (skipped when tests never ran, so pattern stats stay accurate)
+      if (!sandboxUnavailable) await this.recordFixOutcome(
         {
           errorFingerprint: pattern.errorFingerprint,
           errorDescription: pattern.errorDescription,
@@ -725,21 +730,20 @@ export class FixerAgent {
 
     const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-fixer-'))
     try {
-      applyFileChanges(workDir, fileChanges)
+      applyWorkspaceFileChanges(workDir, fileChanges)
 
       // Run regression tests
       let regressionPassed = false
+      let sandboxUnavailable = false
       let coverage: number | undefined
       const regressionErrors: string[] = []
       try {
-        const testOutput = execSync(
-          'npx jest --passWithNoTests',
-          { cwd: workDir, stdio: 'pipe', timeout: 120_000 },
-        ).toString()
+        const testOutput = runRegressionTests(workDir)
         regressionPassed = true
         const coverageMatch = testOutput.match(/Lines\s*:\s*([\d.]+)%/)
         if (coverageMatch?.[1]) coverage = parseFloat(coverageMatch[1])
       } catch (err) {
+        if (err instanceof SandboxUnavailableError) sandboxUnavailable = true
         regressionErrors.push(String(err).slice(0, 500))
         taskLog.warn({ err }, 'Regression tests failed')
       }
@@ -758,8 +762,8 @@ export class FixerAgent {
         taskLog.warn({ err }, 'Confidence engine failed')
       }
 
-      // Record the fix outcome for future pattern matching
-      await this.recordFixOutcome(
+      // Record the fix outcome for future pattern matching (skipped when tests never ran)
+      if (!sandboxUnavailable) await this.recordFixOutcome(
         {
           errorFingerprint: classification.fingerprint,
           errorDescription: payload.errorMessage,
@@ -1018,17 +1022,16 @@ function buildFixPrBody(opts: FixPrBodyOptions): string {
 // File-system helpers
 // ---------------------------------------------------------------------------
 
-function applyFileChanges(workDir: string, changes: FileChange[]): void {
-  for (const change of changes) {
-    const fullPath = path.join(workDir, change.filePath)
-    const dir = path.dirname(fullPath)
-    if (change.action === 'delete') {
-      try { fs.unlinkSync(fullPath) } catch { /* may not exist */ }
-      continue
-    }
-    fs.mkdirSync(dir, { recursive: true })
-    fs.writeFileSync(fullPath, change.content, 'utf-8')
-  }
+/**
+ * Run the regression suite for generated fix code. Generated tests and jest
+ * configs are untrusted, so they only run in the sandbox (no host env, no
+ * network, lifecycle scripts disabled). Throws if the suite fails or the
+ * sandbox is unavailable.
+ */
+function runRegressionTests(workDir: string): string {
+  assertSandboxAvailable()
+  installSandboxDependencies(workDir)
+  return runInSandbox(workDir, ['npx', '--no-install', 'jest', '--passWithNoTests'], { timeoutMs: 120_000 })
 }
 
 // ---------------------------------------------------------------------------
