@@ -1,19 +1,21 @@
 /**
  * Project API routes
  * Handles: project CRUD, health snapshots, metrics, incidents, approvals, debt
+ * Every handler checks the caller's membership in the project's organization.
  */
 
 import type { FastifyInstance } from 'fastify'
 import { z } from 'zod'
 import { prisma } from '@forge/database'
 import { createLogger } from '@forge/shared'
+import { HttpError, isOrgAdmin, requireCaller, requireOrgPermission, requireProjectPermission } from '../auth.js'
 
 const log = createLogger('routes:projects')
 
 const CreateProjectSchema = z.object({
   name: z.string().min(1).max(100),
   description: z.string().optional(),
-  organizationId: z.string().uuid(),
+  organizationId: z.string().uuid().optional(),
   autonomyLevel: z.enum(['SUGGEST', 'SEMI', 'AUTONOMOUS']).default('SUGGEST'),
 })
 
@@ -28,12 +30,15 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
   // List projects for an organization
   app.get('/api/projects', async (request, reply) => {
     const query = request.query as { organizationId?: string }
-    if (!query.organizationId) {
+    const organizationId = query.organizationId ?? requireCaller(request).organizationId
+    if (!organizationId) {
       return reply.status(400).send({ error: 'organizationId required' })
     }
 
+    await requireOrgPermission(request, organizationId, 'audit:read')
+
     const projects = await prisma.project.findMany({
-      where: { organizationId: query.organizationId, status: { not: 'ARCHIVED' } },
+      where: { organizationId, status: { not: 'ARCHIVED' } },
       select: {
         id: true, name: true, slug: true, status: true,
         startupStage: true, autonomyLevel: true,
@@ -52,6 +57,13 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
       return reply.status(400).send({ error: body.error.flatten() })
     }
 
+    const organizationId = body.data.organizationId ?? requireCaller(request).organizationId
+    if (!organizationId) {
+      return reply.status(400).send({ error: 'organizationId required' })
+    }
+
+    await requireOrgPermission(request, organizationId, 'project:create')
+
     const slug = body.data.name
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, '-')
@@ -59,7 +71,7 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
 
     const project = await prisma.project.create({
       data: {
-        organizationId: body.data.organizationId,
+        organizationId,
         name: body.data.name,
         slug,
         description: body.data.description,
@@ -73,6 +85,7 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
   // Get project health snapshot
   app.get('/api/projects/:projectId/health', async (request, reply) => {
     const { projectId } = request.params as { projectId: string }
+    await requireProjectPermission(request, projectId, 'audit:read')
 
     try {
       const [latestMetrics, pendingApprovals, activeIncidents, openPRs, securityScan] =
@@ -126,6 +139,7 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
   // List incidents
   app.get('/api/projects/:projectId/incidents', async (request, reply) => {
     const { projectId } = request.params as { projectId: string }
+    await requireProjectPermission(request, projectId, 'audit:read')
     const query = request.query as { limit?: string; status?: string }
     const limit = parseInt(query.limit ?? '10', 10)
 
@@ -144,11 +158,31 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
   // List pending approvals
   app.get('/api/projects/:projectId/approvals', async (request, reply) => {
     const { projectId } = request.params as { projectId: string }
+    await requireProjectPermission(request, projectId, 'audit:read')
 
+    // Never select approveToken / rejectToken: they authorize one-click approval
     const approvals = await prisma.approvalRequest.findMany({
       where: { projectId, status: 'PENDING' },
       orderBy: { expiresAt: 'asc' },
-      include: { task: { select: { type: true, priority: true } } },
+      select: {
+        id: true,
+        projectId: true,
+        taskId: true,
+        agentType: true,
+        title: true,
+        businessImpact: true,
+        technicalDetails: true,
+        confidenceScore: true,
+        riskLevel: true,
+        status: true,
+        expiresAt: true,
+        approvedById: true,
+        approvedAt: true,
+        rejectionReason: true,
+        createdAt: true,
+        updatedAt: true,
+        task: { select: { type: true, priority: true } },
+      },
     })
 
     return approvals
@@ -157,6 +191,7 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
   // Get debt items
   app.get('/api/projects/:projectId/debt', async (request, reply) => {
     const { projectId } = request.params as { projectId: string }
+    await requireProjectPermission(request, projectId, 'audit:read')
     const query = request.query as { severity?: string }
 
     const items = await prisma.debtItem.findMany({
@@ -174,6 +209,7 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
   // Get metrics snapshots
   app.get('/api/projects/:projectId/metrics', async (request, reply) => {
     const { projectId } = request.params as { projectId: string }
+    await requireProjectPermission(request, projectId, 'audit:read')
     const query = request.query as { days?: string }
     const days = parseInt(query.days ?? '30', 10)
     const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000)
@@ -195,12 +231,22 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
       return reply.status(400).send({ error: body.error.flatten() })
     }
 
+    const { role } = await requireProjectPermission(request, projectId, 'project:configure')
+    if (body.data.autonomyLevel && !isOrgAdmin(role)) {
+      throw new HttpError(403, 'Only organization owners and admins can change the autonomy level')
+    }
+
     const updated = await prisma.project.update({
       where: { id: projectId },
       data: {
         ...(body.data.autonomyLevel ? { autonomyLevel: body.data.autonomyLevel } : {}),
         ...(body.data.codingStandards ? { codingStandards: body.data.codingStandards } : {}),
         ...(body.data.notificationConfig ? { notificationConfig: body.data.notificationConfig } : {}),
+      },
+      select: {
+        id: true, name: true, slug: true, status: true,
+        startupStage: true, autonomyLevel: true, codingStandards: true,
+        notificationConfig: true, productionUrl: true, updatedAt: true,
       },
     })
 
@@ -210,6 +256,7 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
   // Get activity feed (agent tasks)
   app.get('/api/projects/:projectId/activity', async (request, reply) => {
     const { projectId } = request.params as { projectId: string }
+    await requireProjectPermission(request, projectId, 'audit:read')
     const query = request.query as { page?: string; agentType?: string }
     const page = parseInt(query.page ?? '1', 10)
     const limit = 20
@@ -231,6 +278,7 @@ export async function registerProjectRoutes(app: FastifyInstance): Promise<void>
   // Get recent logs (placeholder — real logs come from Watcher Agent)
   app.get('/api/projects/:projectId/logs', async (request, reply) => {
     const { projectId } = request.params as { projectId: string }
+    await requireProjectPermission(request, projectId, 'audit:read')
 
     // In production this queries the Watcher Agent's log store (Redis/Loki)
     // For now return recent audit log entries
