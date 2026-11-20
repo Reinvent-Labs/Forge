@@ -3,15 +3,76 @@
  * Handles incoming webhooks from: GitHub, Slack, Telegram, Sentry, PostHog, Vercel
  */
 
-import type { FastifyInstance } from 'fastify'
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify'
 import { createLogger } from '@forge/shared'
 import { prisma } from '@forge/database'
+import {
+  verifySentrySignature,
+  verifySharedSecret,
+  verifySlackSignature,
+  verifyVercelSignature,
+} from './webhook-signatures.js'
 
 const log = createLogger('routes:webhooks')
 
+declare module 'fastify' {
+  interface FastifyRequest {
+    rawBody?: Buffer
+  }
+}
+
+function header(request: FastifyRequest, name: string): string | undefined {
+  const value = request.headers[name]
+  return Array.isArray(value) ? value[0] : value
+}
+
+function unauthorized(reply: FastifyReply, source: string): FastifyReply {
+  log.warn({ source }, 'Rejected webhook with missing or invalid signature')
+  return reply.status(401).send({ error: 'Invalid signature' })
+}
+
+/**
+ * Captures the raw body for signature verification and parses JSON and
+ * form-encoded bodies. Scoped to the webhook plugin so other routes keep
+ * Fastify's default parsers.
+ */
+function registerRawBodyParsers(app: FastifyInstance): void {
+  app.removeContentTypeParser('application/json')
+  app.addContentTypeParser(
+    'application/json',
+    { parseAs: 'buffer' },
+    (request, body, done) => {
+      const raw = body as Buffer
+      request.rawBody = raw
+      if (raw.length === 0) return done(null, {})
+      try {
+        done(null, JSON.parse(raw.toString('utf8')))
+      } catch (err) {
+        const error = err as Error & { statusCode?: number }
+        error.statusCode = 400
+        done(error, undefined)
+      }
+    },
+  )
+  app.addContentTypeParser(
+    'application/x-www-form-urlencoded',
+    { parseAs: 'buffer' },
+    (request, body, done) => {
+      const raw = body as Buffer
+      request.rawBody = raw
+      done(null, Object.fromEntries(new URLSearchParams(raw.toString('utf8'))))
+    },
+  )
+}
+
 export async function registerWebhookRoutes(
-  app: FastifyInstance,
+  root: FastifyInstance,
 ): Promise<void> {
+  await root.register(webhookRoutes)
+}
+
+async function webhookRoutes(app: FastifyInstance): Promise<void> {
+  registerRawBodyParsers(app)
 
   // ---------------------------------------------------------------------------
   // GitHub App webhook
@@ -66,6 +127,14 @@ export async function registerWebhookRoutes(
   // Slack interactive components (approve/reject buttons)
   // ---------------------------------------------------------------------------
   app.post('/api/webhooks/slack/interactive', async (request, reply) => {
+    const verified = verifySlackSignature({
+      signingSecret: process.env['SLACK_SIGNING_SECRET'],
+      rawBody: request.rawBody,
+      timestamp: header(request, 'x-slack-request-timestamp'),
+      signature: header(request, 'x-slack-signature'),
+    })
+    if (!verified) return unauthorized(reply, 'slack')
+
     const body = request.body as { payload?: string }
     if (!body.payload) {
       return reply.status(400).send({ error: 'Missing payload' })
@@ -102,6 +171,13 @@ export async function registerWebhookRoutes(
   app.post('/api/webhooks/telegram/:projectId', async (request, reply) => {
     const { projectId } = request.params as { projectId: string }
 
+    if (!verifySharedSecret(
+      process.env['TELEGRAM_WEBHOOK_SECRET'],
+      header(request, 'x-telegram-bot-api-secret-token'),
+    )) {
+      return unauthorized(reply, 'telegram')
+    }
+
     try {
       const { getForgeGitHub: _ } = await import('@forge/github')
       log.debug({ projectId }, 'Telegram webhook received')
@@ -119,6 +195,14 @@ export async function registerWebhookRoutes(
   // ---------------------------------------------------------------------------
   app.post('/api/webhooks/sentry/:projectId', async (request, reply) => {
     const { projectId } = request.params as { projectId: string }
+
+    if (!verifySentrySignature(
+      process.env['SENTRY_WEBHOOK_SECRET'],
+      request.rawBody,
+      header(request, 'sentry-hook-signature'),
+    )) {
+      return unauthorized(reply, 'sentry')
+    }
 
     try {
       const event = request.body as {
@@ -147,6 +231,14 @@ export async function registerWebhookRoutes(
   app.post('/api/webhooks/posthog/:projectId', async (request, reply) => {
     const { projectId } = request.params as { projectId: string }
 
+    // PostHog does not sign webhooks; require a shared secret header instead.
+    if (!verifySharedSecret(
+      process.env['POSTHOG_WEBHOOK_SECRET'],
+      header(request, 'x-forge-webhook-secret'),
+    )) {
+      return unauthorized(reply, 'posthog')
+    }
+
     try {
       const event = request.body as { event?: string; properties?: Record<string, unknown> }
       log.debug({ projectId, event: event.event }, 'PostHog event received')
@@ -168,6 +260,14 @@ export async function registerWebhookRoutes(
   // ---------------------------------------------------------------------------
   app.post('/api/webhooks/vercel/:projectId', async (request, reply) => {
     const { projectId } = request.params as { projectId: string }
+
+    if (!verifyVercelSignature(
+      process.env['VERCEL_WEBHOOK_SECRET'],
+      request.rawBody,
+      header(request, 'x-vercel-signature'),
+    )) {
+      return unauthorized(reply, 'vercel')
+    }
 
     try {
       const event = request.body as {
