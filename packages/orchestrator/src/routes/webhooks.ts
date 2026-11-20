@@ -285,10 +285,12 @@ async function webhookRoutes(app: FastifyInstance): Promise<void> {
   app.post('/api/webhooks/vercel/:projectId', async (request, reply) => {
     const { projectId } = request.params as { projectId: string }
 
+    const vercelSignature = header(request, 'x-vercel-signature')
+    if (!vercelSignature || !request.rawBody) return unauthorized(reply, 'vercel')
     if (!verifyVercelSignature(
       await getVercelWebhookSecret(projectId),
       request.rawBody,
-      header(request, 'x-vercel-signature'),
+      vercelSignature,
     )) {
       return unauthorized(reply, 'vercel')
     }
