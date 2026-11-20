@@ -26,6 +26,28 @@ function header(request: FastifyRequest, name: string): string | undefined {
   return Array.isArray(value) ? value[0] : value
 }
 
+/**
+ * Vercel issues a secret per webhook, so prefer the project's own secret
+ * (`webhookSecret` in its VERCEL integration config) and fall back to the
+ * deployment-wide VERCEL_WEBHOOK_SECRET.
+ */
+async function getVercelWebhookSecret(projectId: string): Promise<string | undefined> {
+  try {
+    const integration = await prisma.projectIntegration.findUnique({
+      where: { projectId_type: { projectId, type: 'VERCEL' } },
+      select: { config: true },
+    })
+    const config = integration?.config
+    if (config && typeof config === 'object' && !Array.isArray(config)) {
+      const secret = (config as Record<string, unknown>)['webhookSecret']
+      if (typeof secret === 'string' && secret.length > 0) return secret
+    }
+  } catch (err) {
+    log.warn({ projectId, error: (err as Error).message }, 'Failed to load Vercel webhook secret')
+  }
+  return process.env['VERCEL_WEBHOOK_SECRET']
+}
+
 function unauthorized(reply: FastifyReply, source: string): FastifyReply {
   log.warn({ source }, 'Rejected webhook with missing or invalid signature')
   return reply.status(401).send({ error: 'Invalid signature' })
@@ -262,7 +284,7 @@ async function webhookRoutes(app: FastifyInstance): Promise<void> {
     const { projectId } = request.params as { projectId: string }
 
     if (!verifyVercelSignature(
-      process.env['VERCEL_WEBHOOK_SECRET'],
+      await getVercelWebhookSecret(projectId),
       request.rawBody,
       header(request, 'x-vercel-signature'),
     )) {
